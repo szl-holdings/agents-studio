@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>SZL Agents Studio</title>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="stylesheet" href="/studio.css">
+  <script defer src="/vendor/lucide.min.js"></script>
+  <script defer src="/vendor/marked.umd.js"></script>
+  <script defer src="/studio.js"></script>
+</head>
+<body>
+  <aside id="sidebar" class="sidebar" aria-label="Conversations">
+    <a class="brand" href="/" aria-label="SZL Agents Studio"><img src="/favicon.png" alt="" width="34" height="34"><span>SZL <b>Agents Studio</b></span></a>
+    <button id="new-chat" class="primary sidebar-new"><i data-lucide="plus"></i>New conversation</button>
+    <label class="search"><i data-lucide="search"></i><input id="search" type="search" placeholder="Search conversations" aria-label="Search conversations"></label>
+    <div class="section-label">CONVERSATIONS <span id="session-count">0</span></div>
+    <nav id="sessions" class="sessions" aria-label="Saved conversations"></nav>
+    <div class="sidebar-bottom">
+      <a href="https://szlholdings-szl-router-control.hf.space" target="_blank" rel="noopener noreferrer"><i data-lucide="network"></i>Cloud control<i data-lucide="arrow-up-right"></i></a>
+      <a href="https://developers.openai.com/api/docs/guides/agents-api/overview" target="_blank" rel="noopener noreferrer"><i data-lucide="book-open"></i>API documentation<i data-lucide="arrow-up-right"></i></a>
+      <div class="local-identity"><span class="local-dot"></span><span>LOCAL WORKSPACE</span><span>SZL</span></div>
+    </div>
+  </aside>
+  <main class="workspace">
+    <header class="topbar">
+      <button id="menu" class="icon-button mobile-menu" aria-label="Toggle conversations" title="Conversations" aria-expanded="false"><i data-lucide="panel-left"></i></button>
+      <div class="heading"><h1 id="conversation-title">New conversation</h1><div id="model-label" class="subtle">New agent / gpt-6-astra</div></div>
+      <span id="run-status" class="status" role="status">Connecting</span>
+      <button id="refresh" class="icon-button" aria-label="Refresh session status" title="Refresh session status"><i data-lucide="refresh-cw"></i></button>
+      <button id="export" class="icon-button" aria-label="Export conversation" title="Export conversation" disabled><i data-lucide="download"></i></button>
+    </header>
+    <div class="viewbar">
+      <div class="tabs" role="tablist" aria-label="Conversation view">
+        <button id="chat-tab" role="tab" aria-selected="true" aria-controls="chat-view"><i data-lucide="messages-square"></i>Conversation</button>
+        <button id="activity-tab" role="tab" aria-selected="false" aria-controls="activity-view"><i data-lucide="activity"></i>Activity <span id="activity-count">0</span></button>
+        <button id="connections-tab" role="tab" aria-selected="false" aria-controls="connections-view"><i data-lucide="network"></i>Connections</button>
+      </div>
+      <button id="details-toggle" class="quiet-button" aria-expanded="false" aria-controls="session-details"><i data-lucide="sliders-horizontal"></i><span>Session</span></button>
+    </div>
+    <section id="session-details" class="session-details" hidden aria-label="Session details">
+      <dl><dt>Model</dt><dd id="detail-model">gpt-6-astra</dd><dt>Tools</dt><dd>Web search (configured)</dd><dt>Environment</dt><dd>None</dd><dt>Credential</dt><dd id="detail-key">Checking</dd><dt>Session ID</dt><dd id="detail-session">Not started</dd><dt>Latest turn</dt><dd id="detail-turn">Not observed</dd><dt>Usage / cost</dt><dd id="detail-usage">UNAVAILABLE</dd></dl>
+    </section>
+    <div id="notice" class="notice" role="alert" hidden></div>
+    <div id="recovery-bar" class="recovery-bar" hidden>
+      <span id="recovery-label">Submission outcome unknown</span>
+      <button id="recover-run" class="quiet-button"><i data-lucide="refresh-cw"></i>Reconnect</button>
+      <button id="check-outcome" class="quiet-button" hidden><i data-lucide="scan-search"></i>Check provider outcome</button>
+      <button id="retry-submission" class="quiet-button" hidden><i data-lucide="send-horizontal"></i>Retry saved submission</button>
+    </div>
+    <section id="chat-view" role="tabpanel" aria-labelledby="chat-tab" class="chat-view">
+      <div id="empty" class="empty-state">
+        <img src="/favicon.png" width="52" height="52" alt="SZL">
+        <p class="eyebrow">NEW AGENT</p><h2 id="empty-heading">What are we working on?</h2>
+        <button id="load-history" class="primary load-history" hidden><i data-lucide="history"></i>Load conversation</button>
+        <div id="suggestions" class="suggestions">
+          <button data-prompt="Research the latest public updates from SZL Holdings on GitHub and Hugging Face. Cite primary sources and clearly separate observed facts from unknowns."><i data-lucide="scan-search"></i><span>SZL public research</span><i data-lucide="arrow-up-right"></i></button>
+          <button data-prompt="Compare three approaches to a problem I will describe. Use current primary sources, state trade-offs, and recommend the smallest useful next step. First ask me what problem to compare."><i data-lucide="git-compare-arrows"></i><span>Compare approaches</span><i data-lucide="arrow-up-right"></i></button>
+          <button data-prompt="Help me check a claim against current public evidence. Ask me for the claim or URL, then separate supported findings, contradictions, and unknowns. Cite direct sources."><i data-lucide="badge-check"></i><span>Check the evidence</span><i data-lucide="arrow-up-right"></i></button>
+        </div>
+      </div>
+      <div class="history-toolbar"><button id="load-older" class="quiet-button" hidden><i data-lucide="history"></i>Load older messages</button><span id="history-note" class="history-note" hidden></span></div>
+      <div id="messages" class="messages" aria-label="Conversation messages"></div>
+    </section>
+    <section id="activity-view" role="tabpanel" aria-labelledby="activity-tab" class="activity-view" hidden>
+      <div class="activity-heading"><h2>Run activity</h2><span id="activity-status" class="subtle">No active run</span></div>
+      <ol id="activity-list" class="activity-list"></ol>
+      <p id="activity-empty" class="subtle">No events observed.</p>
+    </section>
+    <section id="connections-view" role="tabpanel" aria-labelledby="connections-tab" class="connections-view" hidden>
+      <div class="connections-inner">
+        <div class="connections-heading"><h2>Connections</h2><button id="cloud-check" class="quiet-button"><i data-lucide="refresh-cw"></i>Check connection</button></div>
+        <div id="cloud-error" class="connection-error" role="alert" hidden></div>
+        <section class="connection-section" aria-labelledby="local-api-heading">
+          <h3 id="local-api-heading"><i data-lucide="monitor"></i>Local Agents API</h3>
+          <dl class="connection-fields"><dt>Runtime</dt><dd id="local-runtime-state">UNKNOWN</dd><dt>Credential</dt><dd id="local-credential-state">UNKNOWN</dd><dt>Agent</dt><dd id="local-agent-name">New agent / gpt-6-astra</dd></dl>
+        </section>
+        <section class="connection-section" aria-labelledby="cloud-heading">
+          <div class="connection-heading"><h3 id="cloud-heading"><i data-lucide="cloud"></i>SZL cloud</h3><a class="connection-link" href="https://szlholdings-szl-router-control.hf.space" target="_blank" rel="noopener noreferrer">Open control<i data-lucide="arrow-up-right"></i></a></div>
+          <dl class="connection-fields">
+            <dt>Control interface</dt><dd id="cloud-control-state">UNKNOWN</dd>
+            <dt>Hosted inference</dt><dd id="cloud-inference-state">UNKNOWN</dd>
+            <dt>Registry</dt><dd id="cloud-registry-state">UNKNOWN</dd>
+            <dt>Caller authentication</dt><dd id="cloud-caller-state">UNKNOWN</dd>
+            <dt>Provider configuration</dt><dd id="cloud-provider-state">UNKNOWN</dd>
+            <dt>Provider egress</dt><dd id="cloud-egress-state">UNKNOWN</dd>
+            <dt>Runtime witness</dt><dd id="cloud-witness-state">UNKNOWN</dd>
+          </dl>
+        </section>
+        <section class="connection-section" aria-labelledby="cloud-source-heading">
+          <h3 id="cloud-source-heading"><i data-lucide="git-commit-horizontal"></i>Source</h3>
+          <dl class="connection-fields">
+            <dt>Pinned source</dt><dd id="cloud-source-state">UNKNOWN</dd>
+            <dt>Reported revision</dt><dd><code id="cloud-revision">UNKNOWN</code></dd>
+            <dt>Expected revision</dt><dd><code id="cloud-expected-revision">UNKNOWN</code></dd>
+            <dt>Observation</dt><dd id="cloud-observed" aria-live="polite">Not checked</dd>
+          </dl>
+        </section>
+      </div>
+    </section>
+    <footer class="composer-wrap">
+      <form id="composer" class="composer">
+        <textarea id="message" rows="3" maxlength="20000" placeholder="Message New agent..." aria-label="Message New agent" required></textarea>
+        <div class="composer-bottom"><span class="tool-label"><i data-lucide="globe-2"></i>Web search <span class="live-label">CONFIGURED</span></span><div class="composer-actions"><span id="char-count" class="subtle">0 / 20,000</span><button id="stop-run" class="stop-button" type="button" aria-label="Stop active turn" title="Stop active turn" hidden disabled><i data-lucide="square"></i></button><button id="send" class="send-button" type="submit" aria-label="Send message" title="Send message" disabled><i data-lucide="arrow-up"></i></button></div></div>
+      </form>
+      <div class="footer-meta"><span id="connection-label">Local connection</span><span id="operation-label">No run submitted</span></div>
+    </footer>
+  </main>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

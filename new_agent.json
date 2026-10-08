@@ -1,0 +1,27 @@
+{
+  "tools": [
+    {
+      "type": "web_search",
+      "mode": "live",
+      "context_size": "medium",
+      "allowed_domains": null,
+      "location": null
+    }
+  ],
+  "multi_agent": {
+    "enabled": false
+  },
+  "name": "New agent",
+  "model": "gpt-6-astra",
+  "instructions": "",
+  "reasoning": {
+    "effort": "medium",
+    "summary": "auto"
+  },
+  "text": {
+    "format": {
+      "type": "text"
+    },
+    "verbosity": "medium"
+  }
+}

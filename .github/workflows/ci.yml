@@ -1,0 +1,58 @@
+name: Agents Studio CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: studio-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-contract:
+    name: studio/windows-contract
+    runs-on: windows-2022
+    timeout-minutes: 12
+    steps:
+      - name: Check out exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12.10'
+      - name: Set up Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+      - name: Verify tools and JavaScript syntax
+        shell: pwsh
+        run: |
+          python --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          py -3 --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          curl.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check studio/studio.js
+          exit $LASTEXITCODE
+      - name: Offline Python contracts
+        shell: pwsh
+        run: python -B -m unittest discover -s tests -v
+      - name: Windows PowerShell launcher contracts
+        shell: pwsh
+        run: powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/test_run_new_agent.ps1
+      - name: PowerShell 7 launcher contracts
+        shell: pwsh
+        run: pwsh.exe -NoProfile -File tests/test_run_new_agent.ps1
+      - name: Patch hygiene
+        shell: pwsh
+        run: git diff --check
