@@ -13,6 +13,8 @@ __pycache__/
 *.log
 *.tmp
 .venv/
+.venv-hosted/
+hosted/source.json
 .pytest_cache/
 outputs/
 LIVE_RUN.md
