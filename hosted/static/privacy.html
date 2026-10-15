@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Privacy | Agents Studio</title>
+  <link rel="icon" href="/static/favicon.png"><link rel="stylesheet" href="/static/studio.css">
+</head>
+<body class="document-page">
+  <main>
+    <nav><a href="/">Agents Studio</a><a href="https://a-11-oy.com">SZL Holdings</a></nav>
+    <article>
+      <h1>Privacy</h1>
+      <p>Agents Studio uses Hugging Face sign-in. It stores a hash derived from your verified account identifier, your conversation titles and messages, model responses, run state, and usage records in a dedicated Cloudflare D1 database. It does not request access to your Hugging Face repositories or organization.</p>
+      <p>Your text is sent to the dedicated SZL Holdings application and its pinned CPU model. The model cannot call tools or take external actions. The storage service is designed to accept only fixed operations from the application, not browser credentials.</p>
+      <p>Saved conversations remain until you use <strong>Delete my data</strong>. That action deletes your live conversations, messages, runs, and associated write records, then signs out this browser. It does not close your Hugging Face account or revoke other signed-in browser sessions. An owner-free erasure receipt remains. Day-specific pseudonymous usage counters stay until the first successful storage write after that UTC day; they prevent deletion from resetting the daily limit. Cloudflare D1 Time Travel can retain recoverable database history for 7 days on Free or 30 days on Paid plans; deletion from that history is not immediate. Hugging Face and Cloudflare also operate under their own platform policies.</p>
+      <p>Do not enter sensitive or confidential information. The application limits requests and does not treat model output as a verified fact or authorization.</p>
+      <p class="privacy-note">This describes the intended source behavior. Availability and provider configuration are verified separately before public launch.</p>
+    </article>
+  </main>
+</body>
+</html>

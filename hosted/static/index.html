@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Agents Studio | SZL Holdings</title>
+  <link rel="icon" href="/static/favicon.png"><link rel="stylesheet" href="/static/studio.css">
+  <script defer src="/static/lucide.min.js"></script><script defer src="/static/studio.js"></script>
+</head>
+<body>
+  <aside id="sidebar">
+    <a class="brand" href="https://a-11-oy.com"><img src="/static/favicon.png" alt="SZL Holdings" width="36" height="36"><span>Agents Studio<small>SZL Holdings</small></span></a>
+    <button id="new" class="primary" disabled><i data-lucide="plus"></i>New conversation</button>
+    <label class="search"><i data-lucide="search"></i><input id="search" type="search" placeholder="Search conversations" aria-label="Search conversations"></label>
+    <h2>Conversations</h2><nav id="conversations" aria-label="Conversations"></nav>
+    <footer><a href="https://a-11-oy.com">Product<i data-lucide="arrow-up-right"></i></a><a href="https://a11oy.net">Evidence<i data-lucide="arrow-up-right"></i></a><a href="/static/privacy.html">Privacy<i data-lucide="arrow-up-right"></i></a><button id="logout" hidden><i data-lucide="log-out"></i>Sign out</button><button id="delete-account" hidden><i data-lucide="trash-2"></i>Delete my data</button><span id="identity">Not signed in</span></footer>
+  </aside>
+  <main>
+    <header><button id="menu" class="icon" aria-label="Toggle conversations" title="Conversations"><i data-lucide="panel-left"></i></button><div><h1 id="title">Agents Studio</h1><span class="muted">Qwen 2.5 0.5B &middot; CPU &middot; Text only</span></div><button id="refresh" class="icon" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw"></i></button><button id="export" class="icon" disabled title="Download conversation" aria-label="Download conversation"><i data-lucide="download"></i></button><span id="status" role="status">Checking</span></header>
+    <div id="notice" role="alert" hidden></div>
+    <section id="messages" aria-label="Conversation" aria-live="polite"><div id="welcome"><img src="/static/favicon.png" alt="" width="52" height="52"><h2>Your workspace</h2><button id="login" class="primary" disabled><i data-lucide="log-in"></i>Continue with Hugging Face</button><a id="register" href="https://huggingface.co/join">Create a Hugging Face account</a></div></section>
+    <form id="composer"><label for="prompt" class="sr-only">Message</label><textarea id="prompt" maxlength="2000" rows="3" placeholder="Message" disabled></textarea><div><span id="counter" class="muted">0 / 2,000</span><span id="limit" class="muted">20 requests / day</span><button id="send" class="primary icon" type="submit" title="Send message" aria-label="Send message" disabled><i data-lucide="arrow-up"></i></button></div></form>
+    <div class="boundary">Generated text is a proposal. Model quality: UNKNOWN. External actions: off.</div>
+  </main>
+</body>
+</html>
