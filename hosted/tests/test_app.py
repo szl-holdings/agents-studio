@@ -347,6 +347,17 @@ class EngineAdmissionTests(unittest.TestCase):
 
 
 class StoreTransportTests(unittest.TestCase):
+    def _response(self):
+        response = mock.Mock()
+        response.status_code = 200
+        response.headers = {"content-type": "application/json"}
+        response.iter_content = lambda chunk_size: [
+            b'{"status":"available","schema_version":1,"receipt_minted":false}'
+        ]
+        response.__enter__ = lambda self: self
+        response.__exit__ = lambda *args: None
+        return response
+
     def test_store_call_uses_ipv6_and_restores_resolver(self):
         seen = []
         original = urllib3_connection.allowed_gai_family
@@ -354,21 +365,31 @@ class StoreTransportTests(unittest.TestCase):
         class Capture(requests.Session):
             def post(self, url, **kwargs):
                 seen.append(urllib3_connection.allowed_gai_family())
-                response = mock.Mock()
-                response.status_code = 200
-                response.headers = {"content-type": "application/json"}
-                response.iter_content = lambda chunk_size: [
-                    b'{"status":"available","schema_version":1,"receipt_minted":false}'
-                ]
-                response.__enter__ = lambda self: self
-                response.__exit__ = lambda *args: None
-                return response
+                return StoreTransportTests._response(None)
 
         store = Store("https://example.account.workers.dev", "a" * 32)
         with mock.patch("app.requests.Session", Capture):
             body = store.call("check")
         self.assertEqual(body["schema_version"], 1)
         self.assertEqual(seen, [socket.AF_INET6])
+        self.assertIs(urllib3_connection.allowed_gai_family, original)
+
+    def test_store_call_falls_back_to_ipv4_after_transport_failure(self):
+        seen = []
+        original = urllib3_connection.allowed_gai_family
+
+        class Capture(requests.Session):
+            def post(self, url, **kwargs):
+                seen.append(urllib3_connection.allowed_gai_family())
+                if len(seen) == 1:
+                    raise requests.ConnectionError("synthetic")
+                return StoreTransportTests._response(None)
+
+        store = Store("https://example.account.workers.dev", "a" * 32)
+        with mock.patch("app.requests.Session", Capture):
+            body = store.call("check")
+        self.assertEqual(body["schema_version"], 1)
+        self.assertEqual(seen, [socket.AF_INET6, socket.AF_INET])
         self.assertIs(urllib3_connection.allowed_gai_family, original)
 
 
