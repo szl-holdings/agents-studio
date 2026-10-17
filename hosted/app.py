@@ -10,6 +10,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 import uuid
 from datetime import timedelta
 from pathlib import Path
@@ -95,13 +96,41 @@ class Store:
                 try:
                     return self._post(op, data, family, timeout)
                 except requests.RequestException as exc:
-                    print(f"store_transport_failed family={family} error={type(exc).__name__}",
+                    print("store_transport_failed "
+                          f"family={family} error={type(exc).__name__} "
+                          f"{self._failure_diagnostic(exc)}",
                           file=sys.stderr, flush=True)
                     # A mutation may already have committed when its response is lost.
                     # Only replay reads, or failures known to precede request dispatch.
                     if not self._retry_safe(op, exc):
                         raise ApiError("store_unavailable", 503) from None
             raise ApiError("store_unavailable", 503)
+
+    @staticmethod
+    def _failure_diagnostic(exc):
+        """Versions and exception-chain function names. No message or headers."""
+        import urllib3
+        labels = []
+        current = exc
+        seen = set()
+        while current is not None and len(seen) < 8 and id(current) not in seen:
+            seen.add(id(current))
+            labels.append(type(current).__name__)
+            tb = current.__traceback__
+            if tb is not None:
+                for frame in traceback.extract_tb(tb)[-12:]:
+                    name = frame.name or ""
+                    if name in {"<lambda>", "<module>"} or re.fullmatch(
+                            r"[A-Za-z_][A-Za-z0-9_]{0,80}", name):
+                        labels.append(name)
+            if current.__cause__ is not None:
+                current = current.__cause__
+            elif current.__suppress_context__:
+                current = None
+            else:
+                current = current.__context__
+        return (f"requests={requests.__version__} urllib3={urllib3.__version__} "
+                f"chain={','.join(labels)}")
 
     @staticmethod
     def _retry_safe(op, exc):
