@@ -1,6 +1,7 @@
 import copy
 import io
 import socket
+import ssl
 import threading
 import time
 import unittest
@@ -10,7 +11,8 @@ from unittest import mock
 
 from urllib3.util import connection as urllib3_connection
 
-from app import ApiError, ISSUER, Store, StoreFailure, create_app, decode_store_response, owner_key
+from app import (ApiError, ISSUER, Store, StoreFailure, TCP_SEGMENT_CEILING, create_app,
+                 decode_store_response, owner_key)
 from engine import Engine, MAX_INPUT_TOKENS
 
 
@@ -481,6 +483,18 @@ class ScriptedSocket:
     def settimeout(self, value):
         self.timeout = value
 
+    def setsockopt(self, level, option, value):
+        self.harness.events.append(("segment", level, option, value))
+        if getattr(self.harness, "reject_segment", False):
+            raise OSError("unsupported")
+        self.segment_value = value
+
+    def getsockopt(self, level, option):
+        reported = getattr(self.harness, "reported_segment", None)
+        if reported is not None:
+            return reported
+        return self.segment_value
+
     def connect(self, address):
         self.harness.events.append(("connect", address[0]))
         if self.mode == "connect-timeout":
@@ -674,6 +688,43 @@ class StoreTransportTests(unittest.TestCase):
         self.assertIn("result=tls_failure", logs)
         self.assertNotIn("b" * 32, logs)
 
+    def test_segment_ceiling_is_applied_before_connect_and_verification_stays(self):
+        harness = TransportHarness(["ok"], addresses=1)
+        harness.response('{"status":"available","schema_version":1,"receipt_minted":false}')
+        body, logs = self._run(harness, self._store(harness))
+        self.assertEqual(body["schema_version"], 1)
+        segment = ("segment", socket.IPPROTO_TCP, socket.TCP_MAXSEG, TCP_SEGMENT_CEILING)
+        self.assertIn(segment, harness.events)
+        self.assertLess(harness.events.index(segment),
+                        harness.events.index(("connect", "203.0.113.1")))
+        self.assertEqual([event for event in harness.events if event[0] == "tls"],
+                         [("tls", "example.account.workers.dev")])
+        self.assertIn("segment=1200", logs)
+        self.assertEqual(harness.events.count(("send",)), 1)
+        context = ssl.create_default_context()
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
+    def test_rejected_segment_option_still_uses_verified_tls_once(self):
+        harness = TransportHarness(["ok"], addresses=1)
+        harness.reject_segment = True
+        harness.response('{"status":"available","schema_version":1,"receipt_minted":false}')
+        body, logs = self._run(harness, self._store(harness))
+        self.assertEqual(body["schema_version"], 1)
+        self.assertIn("segment=unsupported", logs)
+        self.assertEqual([event for event in harness.events if event[0] == "tls"],
+                         [("tls", "example.account.workers.dev")])
+        self.assertEqual(harness.events.count(("send",)), 1)
+
+    def test_ignored_segment_ceiling_does_not_add_a_send(self):
+        harness = TransportHarness(["ok"], addresses=1)
+        harness.reported_segment = TCP_SEGMENT_CEILING + 260
+        harness.response('{"status":"available","schema_version":1,"receipt_minted":false}')
+        body, logs = self._run(harness, self._store(harness))
+        self.assertEqual(body["schema_version"], 1)
+        self.assertIn("segment=unsupported", logs)
+        self.assertEqual(harness.events.count(("send",)), 1)
+
     def test_redirect_is_not_followed(self):
         harness = TransportHarness(["ok"])
         harness.addresses = 1
@@ -709,6 +760,9 @@ class StoreTransportTests(unittest.TestCase):
         self.assertEqual(harness.events.count(("send",)), 1)
         self.assertEqual([event for event in harness.events if event[0] == "connect"],
                          [("connect", "203.0.113.1")])
+        segment = ("segment", socket.IPPROTO_TCP, socket.TCP_MAXSEG, TCP_SEGMENT_CEILING)
+        self.assertLess(harness.events.index(segment),
+                        harness.events.index(("connect", "203.0.113.1")))
         self.assertEqual(harness.conversations, {"new-conversation"})
         self.assertIn("phase=response", logs)
         self.assertIn("result=response_timeout", logs)
