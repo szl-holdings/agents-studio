@@ -85,15 +85,15 @@ class Store:
     def call(self, op, **data):
         if not self.configured:
             raise ApiError("store_unavailable", 503)
-        # Docker Spaces blackhole IPv6. urllib3 tries AAAA first, and the 3.05s
-        # connect budget then expires before the IPv4 address is attempted.
+        # IPv4 to workers.dev consumes the 3.05s connect budget on this Space,
+        # so urllib3 never reaches the IPv6 address that can complete.
         # The lock keeps one call from restoring dual-stack DNS under another.
         with self._dns_lock:
-            return self._call_ipv4(op, data)
+            return self._call_ipv6(op, data)
 
-    def _call_ipv4(self, op, data):
+    def _call_ipv6(self, op, data):
         previous_family = urllib3_connection.allowed_gai_family
-        urllib3_connection.allowed_gai_family = lambda: socket.AF_INET
+        urllib3_connection.allowed_gai_family = lambda: socket.AF_INET6
         try:
             # A new client avoids sharing mutable cookies or adapters across threads.
             with requests.Session() as client:

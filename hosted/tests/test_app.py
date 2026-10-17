@@ -347,7 +347,7 @@ class EngineAdmissionTests(unittest.TestCase):
 
 
 class StoreTransportTests(unittest.TestCase):
-    def test_store_call_uses_ipv4_and_restores_resolver(self):
+    def test_store_call_uses_ipv6_and_restores_resolver(self):
         seen = []
         original = urllib3_connection.allowed_gai_family
 
@@ -368,7 +368,7 @@ class StoreTransportTests(unittest.TestCase):
         with mock.patch("app.requests.Session", Capture):
             body = store.call("check")
         self.assertEqual(body["schema_version"], 1)
-        self.assertEqual(seen, [socket.AF_INET])
+        self.assertEqual(seen, [socket.AF_INET6])
         self.assertIs(urllib3_connection.allowed_gai_family, original)
 
 
