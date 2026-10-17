@@ -6,6 +6,8 @@ import json
 import os
 import re
 import secrets
+import socket
+import threading
 import time
 import uuid
 from datetime import timedelta
@@ -13,6 +15,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 import requests
+from urllib3.util import connection as urllib3_connection
 from authlib.integrations.flask_client import OAuth
 from authlib.integrations.requests_client import OAuth2Session
 from flask import Flask, jsonify, redirect, request, session
@@ -71,6 +74,8 @@ def valid_store_url(value):
 
 
 class Store:
+    _dns_lock = threading.Lock()
+
     def __init__(self, url, secret):
         self.url = url
         self.secret = secret
@@ -80,6 +85,15 @@ class Store:
     def call(self, op, **data):
         if not self.configured:
             raise ApiError("store_unavailable", 503)
+        # Docker Spaces blackhole IPv6. urllib3 tries AAAA first, and the 3.05s
+        # connect budget then expires before the IPv4 address is attempted.
+        # The lock keeps one call from restoring dual-stack DNS under another.
+        with self._dns_lock:
+            return self._call_ipv4(op, data)
+
+    def _call_ipv4(self, op, data):
+        previous_family = urllib3_connection.allowed_gai_family
+        urllib3_connection.allowed_gai_family = lambda: socket.AF_INET
         try:
             # A new client avoids sharing mutable cookies or adapters across threads.
             with requests.Session() as client:
@@ -118,6 +132,8 @@ class Store:
             raise
         except (requests.RequestException, ValueError, TypeError):
             raise ApiError("store_unavailable", 503) from None
+        finally:
+            urllib3_connection.allowed_gai_family = previous_family
 
 
 def owner_key(subject):

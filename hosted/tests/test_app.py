@@ -1,10 +1,15 @@
 import copy
+import socket
 import time
 import unittest
 import uuid
 from contextlib import contextmanager
+from unittest import mock
 
-from app import ApiError, ISSUER, create_app, owner_key
+import requests
+from urllib3.util import connection as urllib3_connection
+
+from app import ApiError, ISSUER, Store, create_app, owner_key
 from engine import Engine, MAX_INPUT_TOKENS
 
 
@@ -339,6 +344,32 @@ class EngineAdmissionTests(unittest.TestCase):
         with engine.admission([{"role": "user", "content": "hello"}]):
             self.assertTrue(engine._lock.locked())
         self.assertFalse(engine._lock.locked())
+
+
+class StoreTransportTests(unittest.TestCase):
+    def test_store_call_uses_ipv4_and_restores_resolver(self):
+        seen = []
+        original = urllib3_connection.allowed_gai_family
+
+        class Capture(requests.Session):
+            def post(self, url, **kwargs):
+                seen.append(urllib3_connection.allowed_gai_family())
+                response = mock.Mock()
+                response.status_code = 200
+                response.headers = {"content-type": "application/json"}
+                response.iter_content = lambda chunk_size: [
+                    b'{"status":"available","schema_version":1,"receipt_minted":false}'
+                ]
+                response.__enter__ = lambda self: self
+                response.__exit__ = lambda *args: None
+                return response
+
+        store = Store("https://example.account.workers.dev", "a" * 32)
+        with mock.patch("app.requests.Session", Capture):
+            body = store.call("check")
+        self.assertEqual(body["schema_version"], 1)
+        self.assertEqual(seen, [socket.AF_INET])
+        self.assertIs(urllib3_connection.allowed_gai_family, original)
 
 
 if __name__ == "__main__":
