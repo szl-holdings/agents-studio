@@ -703,7 +703,7 @@ class StoreTransportTests(unittest.TestCase):
                         harness.events.index(("connect", "203.0.113.1")))
         self.assertEqual([event for event in harness.events if event[0] == "tls"],
                          [("tls", "example.account.workers.dev")])
-        self.assertIn("segment=1200", logs)
+        self.assertIn(f"segment={TCP_SEGMENT_CEILING}", logs)
         self.assertEqual(harness.events.count(("send",)), 1)
         context = ssl.create_default_context()
         self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
@@ -762,7 +762,7 @@ class StoreTransportTests(unittest.TestCase):
         harness.response('{"status":"available","schema_version":1,"receipt_minted":false}')
         body, logs = self._run(harness, self._store(harness))
         self.assertEqual(body["schema_version"], 1)
-        self.assertIn("segment=unsupported", logs)
+        self.assertIn(f"segment=rejected:{TCP_SEGMENT_CEILING + 260}", logs)
         self.assertEqual(harness.events.count(("send",)), 1)
 
     def test_redirect_is_not_followed(self):
