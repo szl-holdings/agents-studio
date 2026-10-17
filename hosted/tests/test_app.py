@@ -11,8 +11,9 @@ from unittest import mock
 
 from urllib3.util import connection as urllib3_connection
 
-from app import (ApiError, ISSUER, Store, StoreFailure, TCP_SEGMENT_CEILING, create_app,
-                 decode_store_response, owner_key)
+from app import (ApiError, HANDSHAKE_WINDOW_BYTES, ISSUER, RESPONSE_WINDOW_BYTES, Store,
+                 StoreFailure, TCP_SEGMENT_CEILING, create_app, decode_store_response,
+                 owner_key)
 from engine import Engine, MAX_INPUT_TOKENS
 
 
@@ -479,21 +480,24 @@ class ScriptedSocket:
         self.mode = mode
         self.timeout = None
         self.sent = b""
+        self.options = {}
 
     def settimeout(self, value):
         self.timeout = value
 
     def setsockopt(self, level, option, value):
-        self.harness.events.append(("segment", level, option, value))
+        kind = "segment" if option == socket.TCP_MAXSEG else "window"
+        self.harness.events.append((kind, level, option, value))
         if getattr(self.harness, "reject_segment", False):
             raise OSError("unsupported")
-        self.segment_value = value
+        self.options[(level, option)] = value
 
     def getsockopt(self, level, option):
-        reported = getattr(self.harness, "reported_segment", None)
-        if reported is not None:
-            return reported
-        return self.segment_value
+        if option == socket.TCP_MAXSEG:
+            reported = getattr(self.harness, "reported_segment", None)
+            if reported is not None:
+                return reported
+        return self.options[(level, option)]
 
     def connect(self, address):
         self.harness.events.append(("connect", address[0]))
@@ -704,6 +708,42 @@ class StoreTransportTests(unittest.TestCase):
         context = ssl.create_default_context()
         self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
         self.assertTrue(context.check_hostname)
+
+    def test_handshake_window_is_small_until_the_certificate_verifies(self):
+        option = 10
+        with mock.patch.object(socket, "TCP_WINDOW_CLAMP", option, create=True):
+            harness = TransportHarness(["ok"], addresses=1)
+            harness.response('{"status":"available","schema_version":1,"receipt_minted":false}')
+            body, logs = self._run(harness, self._store(harness))
+        self.assertEqual(body["schema_version"], 1)
+        narrowed = ("window", socket.IPPROTO_TCP, option, HANDSHAKE_WINDOW_BYTES)
+        widened = ("window", socket.IPPROTO_TCP, option, RESPONSE_WINDOW_BYTES)
+        self.assertLess(harness.events.index(narrowed),
+                        harness.events.index(("connect", "203.0.113.1")))
+        self.assertLess(harness.events.index(("tls", "example.account.workers.dev")),
+                        harness.events.index(widened))
+        self.assertLess(harness.events.index(widened), harness.events.index(("send",)))
+        self.assertIn("window=536", logs)
+        self.assertEqual(harness.events.count(("send",)), 1)
+        context = ssl.create_default_context()
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
+    def test_tls_timeout_does_not_widen_the_window_or_send(self):
+        option = 10
+        with mock.patch.object(socket, "TCP_WINDOW_CLAMP", option, create=True):
+            harness = TransportHarness(["tls-timeout"], addresses=1)
+            body, logs = self._run(harness, self._store(harness))
+        self.assertIsInstance(body, ApiError)
+        self.assertEqual(body.reason, "tls_failure")
+        self.assertFalse(body.submitted)
+        self.assertNotIn(("send",), harness.events)
+        self.assertNotIn(("window", socket.IPPROTO_TCP, option, RESPONSE_WINDOW_BYTES),
+                         harness.events)
+        self.assertIn(("window", socket.IPPROTO_TCP, option, HANDSHAKE_WINDOW_BYTES),
+                      harness.events)
+        self.assertIn("window=536", logs)
+        self.assertIn("result=tls_failure", logs)
 
     def test_rejected_segment_option_still_uses_verified_tls_once(self):
         harness = TransportHarness(["ok"], addresses=1)
