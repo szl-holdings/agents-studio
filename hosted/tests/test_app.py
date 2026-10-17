@@ -1,4 +1,5 @@
 import copy
+import io
 import socket
 import sqlite3
 import time
@@ -9,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import requests
+import urllib3
 from urllib3.util import connection as urllib3_connection
 
 from app import ApiError, ISSUER, Store, create_app, owner_key
@@ -423,6 +425,36 @@ class StoreTransportTests(unittest.TestCase):
             body = store.call("check")
         self.assertEqual(body["schema_version"], 1)
         self.assertEqual(seen, [socket.AF_INET6, socket.AF_INET])
+        self.assertIs(urllib3_connection.allowed_gai_family, original)
+
+    def test_transport_failure_log_records_versions_and_function_names_only(self):
+        secret = "super-secret-header-value"
+        original = urllib3_connection.allowed_gai_family
+
+        class Capture(requests.Session):
+            def post(self, url, **kwargs):
+                try:
+                    def connect():
+                        raise OSError(secret)
+                    connect()
+                except OSError as inner:
+                    raise requests.ReadTimeout("outer-" + secret) from inner
+
+        store = Store("https://example.account.workers.dev", "a" * 32)
+        stderr = io.StringIO()
+        with mock.patch("app.requests.Session", Capture), mock.patch("app.sys.stderr", stderr):
+            with self.assertRaises(ApiError):
+                store.call("purge", owner=OWNER)
+        text = stderr.getvalue()
+        self.assertNotIn(secret, text)
+        self.assertNotIn("Authorization", text)
+        self.assertNotIn("Bearer", text)
+        self.assertIn(f"requests={requests.__version__}", text)
+        self.assertIn(f"urllib3={urllib3.__version__}", text)
+        self.assertIn("error=ReadTimeout", text)
+        self.assertIn("connect", text)
+        self.assertIn("OSError", text)
+        self.assertEqual(text.count("store_transport_failed"), 1)
         self.assertIs(urllib3_connection.allowed_gai_family, original)
 
     def test_purge_lost_response_does_not_erase_later_data(self):
