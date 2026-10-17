@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 import requests
 from urllib3.util import connection as urllib3_connection
+from urllib3.exceptions import MaxRetryError, NewConnectionError
 from authlib.integrations.flask_client import OAuth
 from authlib.integrations.requests_client import OAuth2Session
 from flask import Flask, jsonify, redirect, request, session
@@ -96,7 +97,22 @@ class Store:
                 except requests.RequestException as exc:
                     print(f"store_transport_failed family={family} error={type(exc).__name__}",
                           file=sys.stderr, flush=True)
+                    # A mutation may already have committed when its response is lost.
+                    # Only replay reads, or failures known to precede request dispatch.
+                    if not self._retry_safe(op, exc):
+                        raise ApiError("store_unavailable", 503) from None
             raise ApiError("store_unavailable", 503)
+
+    @staticmethod
+    def _retry_safe(op, exc):
+        if op in {"check", "list", "get"} or isinstance(exc, requests.ConnectTimeout):
+            return True
+        # Requests wraps urllib3 connection-establishment failures this way.
+        # A bare ConnectionError or a ProtocolError can occur after a commit.
+        wrapped = exc.args[0] if len(exc.args) == 1 else None
+        return (isinstance(exc, requests.ConnectionError)
+                and isinstance(wrapped, MaxRetryError)
+                and isinstance(wrapped.reason, NewConnectionError))
 
     def _post(self, op, data, family, timeout):
         previous_family = urllib3_connection.allowed_gai_family
