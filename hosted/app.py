@@ -31,6 +31,10 @@ CONNECT_BUDGET_SECONDS = 8
 ADDRESS_BUDGET_SECONDS = 3
 IPV6_BUDGET_SECONDS = 1
 READ_BUDGET_SECONDS = 15
+# The Space completes the small TCP handshake and then waits out the address
+# budget with TimeoutError, so no certificate is received to verify. Announce
+# this MSS before connect so the peer's larger handshake flight stays segmented.
+TCP_SEGMENT_CEILING = 1200
 UUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 LIMITS = {"prompt_characters": 2000, "output_tokens": MAX_OUTPUT_TOKENS,
           "daily_user_runs": 20, "daily_global_runs": 200, "conversations": 100}
@@ -210,6 +214,19 @@ class Store:
                    ms=failure.elapsed_ms, result=failure.reason, error=failure.error_name)
         raise failure
 
+    def _limit_segment(self, sock):
+        option = getattr(socket, "TCP_MAXSEG", None)
+        if option is None:
+            return "unsupported"
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, option, TCP_SEGMENT_CEILING)
+            actual = sock.getsockopt(socket.IPPROTO_TCP, option)
+        except OSError:
+            return "unsupported"
+        if isinstance(actual, int) and 0 < actual <= TCP_SEGMENT_CEILING:
+            return str(actual)
+        return "unsupported"
+
     def _one_address(self, op, data, host, family, info, index, remaining, correlation):
         af, socktype, proto, _canon, sockaddr = info
         address_id = f"{index}-" + hashlib.sha256(str(sockaddr[0]).encode()).hexdigest()[:8]
@@ -218,6 +235,7 @@ class Store:
         sock = socket.socket(af, socktype, proto)
         closer = sock
         try:
+            segment = self._limit_segment(sock)
             sock.settimeout(budget)
             try:
                 sock.connect(sockaddr)
@@ -228,7 +246,8 @@ class Store:
                 raise StoreFailure("connect_failure", False, "tcp", self._elapsed(started),
                                    type(exc).__name__) from None
             self._emit(correlation, family=self._family_name(family), phase="tcp",
-                       ms=self._elapsed(started), address=address_id, result="connected")
+                       ms=self._elapsed(started), address=address_id, segment=segment,
+                       result="connected")
             tls_started = self._clock()
             tls_budget = (started + budget) - tls_started
             if tls_budget <= 0:
@@ -407,7 +426,7 @@ class Store:
                 "python_threads": threading.active_count()}
 
     def _emit(self, correlation, **fields):
-        order = ("family", "phase", "ms", "addresses", "address", "result", "error",
+        order = ("family", "phase", "ms", "addresses", "address", "segment", "result", "error",
                  "proxy_env", "trust_env", "direct", "rss_kb", "proc_threads", "python_threads")
         parts = [f"store_transport correlation={correlation}"]
         for key in order:
