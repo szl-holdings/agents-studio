@@ -456,13 +456,30 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
                         raise ApiError("store_unavailable", 503)
                     return jsonify(status="completed", run=completed["run"], receipt=completed.get("receipt"))
                 except Exception:
-                    # A lost completion response may still have committed. Never resend
-                    # generation and never replace the unresolved reservation with success.
+                    # A lost completion response may still have committed. Read it
+                    # back before any other mutation. Never resend generation, and
+                    # never mark a committed completion uncertain.
+                    observed = None
                     try:
-                        store.call("uncertain", owner=user["owner"], run_id=saved["id"])
+                        snapshot = store.call("get", owner=user["owner"], id=conversation_id)
+                        runs = snapshot.get("runs") if isinstance(snapshot, dict) else None
+                        if isinstance(runs, list):
+                            observed = next((item for item in runs
+                                             if isinstance(item, dict)
+                                             and item.get("id") == saved["id"]
+                                             and item.get("owner") == user["owner"]), None)
                     except Exception:
-                        pass
-                    return jsonify(status="uncertain", run_id=saved["id"], error="run_outcome_uncertain"), 503
+                        observed = None
+                    if (isinstance(observed, dict) and observed.get("state") == "completed"
+                            and isinstance(observed.get("output"), str)):
+                        return jsonify(status="completed", run=observed, receipt=None)
+                    if isinstance(observed, dict) and observed.get("state") == "pending":
+                        try:
+                            store.call("uncertain", owner=user["owner"], run_id=saved["id"])
+                        except Exception:
+                            pass
+                    return jsonify(status="uncertain", run_id=saved["id"],
+                                   error="run_outcome_uncertain"), 503
         except ValueError as error:
             if str(error) == "context_limit":
                 raise ApiError("context_limit", 400) from None
