@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -85,15 +86,21 @@ class Store:
     def call(self, op, **data):
         if not self.configured:
             raise ApiError("store_unavailable", 503)
-        # IPv4 to workers.dev consumes the 3.05s connect budget on this Space,
-        # so urllib3 never reaches the IPv6 address that can complete.
+        # On this Space, one address family fails immediately and the other
+        # consumes a 3.05s connect budget. Try IPv6 first, then IPv4 longer.
         # The lock keeps one call from restoring dual-stack DNS under another.
         with self._dns_lock:
-            return self._call_ipv6(op, data)
+            for family, timeout in ((socket.AF_INET6, (1, 15)), (socket.AF_INET, (8, 15))):
+                try:
+                    return self._post(op, data, family, timeout)
+                except requests.RequestException as exc:
+                    print(f"store_transport_failed family={family} error={type(exc).__name__}",
+                          file=sys.stderr, flush=True)
+            raise ApiError("store_unavailable", 503)
 
-    def _call_ipv6(self, op, data):
+    def _post(self, op, data, family, timeout):
         previous_family = urllib3_connection.allowed_gai_family
-        urllib3_connection.allowed_gai_family = lambda: socket.AF_INET6
+        urllib3_connection.allowed_gai_family = lambda: family
         try:
             # A new client avoids sharing mutable cookies or adapters across threads.
             with requests.Session() as client:
@@ -101,7 +108,7 @@ class Store:
                 with client.post(self.url + "/v1/store", json={"op": op, **data},
                                  headers={"Authorization": "Bearer " + self.secret,
                                           "Accept": "application/json"},
-                                 timeout=(3.05, 15), allow_redirects=False, stream=True) as response:
+                                 timeout=timeout, allow_redirects=False, stream=True) as response:
                     if response.status_code not in {200, 400, 404, 409, 413, 429}:
                         raise ApiError("store_unavailable", 503)
                     if response.headers.get("content-type", "").split(";")[0] != "application/json":
@@ -130,7 +137,9 @@ class Store:
                     return body
         except ApiError:
             raise
-        except (requests.RequestException, ValueError, TypeError):
+        except requests.RequestException:
+            raise
+        except (ValueError, TypeError):
             raise ApiError("store_unavailable", 503) from None
         finally:
             urllib3_connection.allowed_gai_family = previous_family
