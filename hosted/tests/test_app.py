@@ -1,13 +1,14 @@
 import copy
 import socket
+import sqlite3
 import time
 import unittest
 import uuid
 from contextlib import contextmanager
+from pathlib import Path
 from unittest import mock
 
 import requests
-from urllib3.exceptions import MaxRetryError, NewConnectionError, ProtocolError
 from urllib3.util import connection as urllib3_connection
 
 from app import ApiError, ISSUER, Store, create_app, owner_key
@@ -424,84 +425,169 @@ class StoreTransportTests(unittest.TestCase):
         self.assertEqual(seen, [socket.AF_INET6, socket.AF_INET])
         self.assertIs(urllib3_connection.allowed_gai_family, original)
 
-    def _lost_response_errors(self):
-        # These can be raised after the Worker has already committed a purge.
-        return (
-            requests.ConnectionError("synthetic lost response"),
-            requests.ConnectionError(ProtocolError("synthetic lost response")),
-            requests.ReadTimeout("synthetic lost response"),
-        )
-
     def test_purge_lost_response_does_not_erase_later_data(self):
-        original = urllib3_connection.allowed_gai_family
-        for err in self._lost_response_errors():
-            with self.subTest(error=type(err).__name__ + ":" + type(err.args[0]).__name__):
-                state = {"rows": ["original"], "attempts": []}
+        for error_type in (requests.ConnectionError, requests.ReadTimeout,
+                           requests.exceptions.ChunkedEncodingError):
+            with self.subTest(error=error_type.__name__):
+                records = ["before"]
+                posts = []
+                original = urllib3_connection.allowed_gai_family
 
                 class Capture(requests.Session):
                     def post(self, url, **kwargs):
-                        state["attempts"].append(urllib3_connection.allowed_gai_family())
-                        if len(state["attempts"]) == 1:
-                            state["rows"].clear()
-                            state["rows"].append("later")
-                            raise err
-                        state["rows"].clear()
-                        return StoreTransportTests._response(None)
+                        posts.append(urllib3_connection.allowed_gai_family())
+                        records.clear()  # The original purge commits.
+                        response = StoreTransportTests._response(None)
+                        if len(posts) == 1:
+                            records.append("created-after-first-purge")
+
+                            def lost_response(chunk_size):
+                                yield b'{"status":'
+                                raise error_type("synthetic response lost after commit")
+                            response.iter_content = lost_response
+                        return response
 
                 store = Store("https://example.account.workers.dev", "a" * 32)
                 with mock.patch("app.requests.Session", Capture):
-                    with self.assertRaises(ApiError) as caught:
-                        store.call("purge", owner="synthetic-owner")
-                self.assertEqual(caught.exception.code, "store_unavailable")
-                self.assertEqual(caught.exception.status, 503)
-                self.assertEqual(state["rows"], ["later"])
-                self.assertEqual(state["attempts"], [socket.AF_INET6])
+                    with self.assertRaises(ApiError) as raised:
+                        store.call("purge", owner=OWNER)
+                self.assertEqual((raised.exception.code, raised.exception.status),
+                                 ("store_unavailable", 503))
+                self.assertEqual(posts, [socket.AF_INET6])
+                self.assertEqual(records, ["created-after-first-purge"])
                 self.assertIs(urllib3_connection.allowed_gai_family, original)
 
-    def test_pre_dispatch_purge_failure_still_reaches_ipv4(self):
-        refused = requests.ConnectionError(MaxRetryError(
-            mock.Mock(), "https://example.account.workers.dev/v1/store",
-            NewConnectionError(mock.Mock(), "synthetic refused connection")))
+    def test_lost_purge_response_keeps_later_same_owner_conversation(self):
+        # Schema file applied to a private memory database. No live Worker or D1.
+        schema = Path(__file__).resolve().parents[1].joinpath("edge", "schema.sql").read_text(encoding="utf-8")
+        for error_type in (requests.ConnectionError, requests.ReadTimeout,
+                           requests.exceptions.ChunkedEncodingError):
+            with self.subTest(error=error_type.__name__):
+                db = sqlite3.connect(":memory:")
+                try:
+                    db.executescript(schema)
+                    db.execute(
+                        "INSERT INTO conversations (owner, id, title, created_at) VALUES (?, ?, ?, ?)",
+                        (OWNER, str(uuid.uuid4()), "Original", "2026-10-16T00:00:00.000Z"))
+                    db.commit()
+                    posts = []
+                    later_id = str(uuid.uuid4())
+                    original = urllib3_connection.allowed_gai_family
+
+                    def apply_purge():
+                        receipt_id = str(uuid.uuid4())
+                        db.execute("BEGIN IMMEDIATE")
+                        try:
+                            db.execute(
+                                """INSERT INTO erasure_receipts
+                                   (id, kind, created_at, source_revision, evidence_class, signing_status)
+                                   SELECT ?, 'account.data_erased', ?, ?, 'DECLARED', 'UNSIGNED'
+                                   WHERE EXISTS (SELECT 1 FROM messages WHERE owner = ?)
+                                     OR EXISTS (SELECT 1 FROM runs WHERE owner = ?)
+                                     OR EXISTS (SELECT 1 FROM receipts WHERE owner = ?)
+                                     OR EXISTS (SELECT 1 FROM conversations WHERE owner = ?)""",
+                                (receipt_id, "2026-10-17T00:00:00.000Z", "c" * 40,
+                                 OWNER, OWNER, OWNER, OWNER))
+                            for table in ("messages", "runs", "receipts", "conversations"):
+                                db.execute(f"DELETE FROM {table} WHERE owner = ?", (OWNER,))
+                            db.execute("COMMIT")
+                        except Exception:
+                            db.execute("ROLLBACK")
+                            raise
+
+                    class Capture(requests.Session):
+                        def post(self, url, **kwargs):
+                            posts.append(urllib3_connection.allowed_gai_family())
+                            payload = kwargs["json"]
+                            if payload.get("op") != "purge" or payload.get("owner") != OWNER:
+                                raise AssertionError("purge targeted unexpected storage")
+                            apply_purge()
+                            if len(posts) == 1:
+                                db.execute(
+                                    "INSERT INTO conversations (owner, id, title, created_at) VALUES (?, ?, ?, ?)",
+                                    (OWNER, later_id, "Synthetic conversation",
+                                     "2026-10-17T00:00:01.000Z"))
+                                db.commit()
+                                response = StoreTransportTests._response(None)
+
+                                def lost_response(chunk_size):
+                                    yield b'{"status":'
+                                    raise error_type("synthetic response lost after commit")
+                                response.iter_content = lost_response
+                                return response
+                            return StoreTransportTests._response(None)
+
+                    store = Store("https://example.account.workers.dev", "a" * 32)
+                    with mock.patch("app.requests.Session", Capture):
+                        with self.assertRaises(ApiError) as raised:
+                            store.call("purge", owner=OWNER)
+                    self.assertEqual(raised.exception.status, 503)
+                    self.assertEqual(posts, [socket.AF_INET6])
+                    self.assertEqual(db.execute("SELECT COUNT(*) FROM erasure_receipts").fetchone()[0], 1)
+                    self.assertEqual(
+                        db.execute("SELECT id, title FROM conversations WHERE owner = ?", (OWNER,)).fetchall(),
+                        [(later_id, "Synthetic conversation")])
+                    self.assertIs(urllib3_connection.allowed_gai_family, original)
+                finally:
+                    db.close()
+
+    def test_transport_retry_policy_defaults_unknown_operations_to_writes(self):
+        from urllib3.exceptions import MaxRetryError, NewConnectionError, ProtocolError
+
+        failures = [
+            (requests.ConnectTimeout("synthetic pre-connect"), True),
+            (requests.ConnectionError(MaxRetryError(None, "/v1/store",
+                NewConnectionError(None, "synthetic ENETUNREACH"))), True),
+            (requests.ConnectionError("synthetic ambiguous"), False),
+            (requests.ReadTimeout("synthetic lost response"), False),
+            (requests.exceptions.ChunkedEncodingError("synthetic truncation"), False),
+            (requests.ConnectionError(MaxRetryError(None, "/v1/store",
+                ProtocolError("synthetic post-dispatch disconnect"))), False),
+        ]
+        for op in ("check", "list", "get", "create", "reserve",
+                   "complete", "uncertain", "purge", "future_write"):
+            for error, preconnect in failures:
+                with self.subTest(op=op, error=type(error).__name__, preconnect=preconnect):
+                    seen = []
+                    original = urllib3_connection.allowed_gai_family
+
+                    class Capture(requests.Session):
+                        def post(self, url, **kwargs):
+                            seen.append(urllib3_connection.allowed_gai_family())
+                            if len(seen) == 1:
+                                raise error
+                            return StoreTransportTests._response(None)
+
+                    store = Store("https://example.account.workers.dev", "a" * 32)
+                    retry = op in {"check", "list", "get"} or preconnect
+                    with mock.patch("app.requests.Session", Capture):
+                        if retry:
+                            self.assertEqual(store.call(op, owner=OWNER)["schema_version"], 1)
+                        else:
+                            with self.assertRaises(ApiError) as raised:
+                                store.call(op, owner=OWNER)
+                            self.assertEqual(raised.exception.status, 503)
+                    self.assertEqual(seen, [socket.AF_INET6, socket.AF_INET] if retry
+                                     else [socket.AF_INET6])
+                    self.assertIs(urllib3_connection.allowed_gai_family, original)
+
+    def test_http_failure_does_not_replay_even_read(self):
         original = urllib3_connection.allowed_gai_family
-        for err in (requests.ConnectTimeout("synthetic connect timeout"), refused):
-            with self.subTest(error=type(err).__name__):
-                state = {"rows": ["original"], "attempts": []}
+        seen = []
 
-                class Capture(requests.Session):
-                    def post(self, url, **kwargs):
-                        state["attempts"].append(urllib3_connection.allowed_gai_family())
-                        if len(state["attempts"]) == 1:
-                            raise err
-                        return StoreTransportTests._response(None)
+        class Capture(requests.Session):
+            def post(self, url, **kwargs):
+                seen.append(urllib3_connection.allowed_gai_family())
+                response = StoreTransportTests._response(None)
+                response.status_code = 503
+                return response
 
-                store = Store("https://example.account.workers.dev", "a" * 32)
-                with mock.patch("app.requests.Session", Capture):
-                    body = store.call("purge", owner="synthetic-owner")
-                self.assertEqual(body["schema_version"], 1)
-                self.assertEqual(state["rows"], ["original"])
-                self.assertEqual(state["attempts"], [socket.AF_INET6, socket.AF_INET])
-                self.assertIs(urllib3_connection.allowed_gai_family, original)
-
-    def test_read_lost_response_still_falls_back_to_ipv4(self):
-        original = urllib3_connection.allowed_gai_family
-        err = requests.ConnectionError(ProtocolError("synthetic lost response"))
-        for op in ("check", "list", "get"):
-            with self.subTest(op=op):
-                seen = []
-
-                class Capture(requests.Session):
-                    def post(self, url, **kwargs):
-                        seen.append(urllib3_connection.allowed_gai_family())
-                        if len(seen) == 1:
-                            raise err
-                        return StoreTransportTests._response(None)
-
-                store = Store("https://example.account.workers.dev", "a" * 32)
-                with mock.patch("app.requests.Session", Capture):
-                    body = store.call(op)
-                self.assertEqual(body["schema_version"], 1)
-                self.assertEqual(seen, [socket.AF_INET6, socket.AF_INET])
-                self.assertIs(urllib3_connection.allowed_gai_family, original)
+        store = Store("https://example.account.workers.dev", "a" * 32)
+        with mock.patch("app.requests.Session", Capture):
+            with self.assertRaises(ApiError):
+                store.call("check")
+        self.assertEqual(seen, [socket.AF_INET6])
+        self.assertIs(urllib3_connection.allowed_gai_family, original)
 
 
 if __name__ == "__main__":
