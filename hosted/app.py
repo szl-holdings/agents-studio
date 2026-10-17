@@ -31,12 +31,12 @@ CONNECT_BUDGET_SECONDS = 8
 ADDRESS_BUDGET_SECONDS = 3
 IPV6_BUDGET_SECONDS = 1
 READ_BUDGET_SECONDS = 15
-# The Space completes the small TCP handshake and then waits out the address
-# budget with TimeoutError, so no certificate is received to verify. Announce
-# this MSS before connect. That announcement is not enough when a middlebox
-# rewrites it, so the handshake also advertises a 536-byte window. The window
-# is widened only after the certificate verifies, before request bytes.
-TCP_SEGMENT_CEILING = 1200
+# The Space completes TCP in a few milliseconds and then times out in TLS.
+# MSS 1200 is accepted by the platform and still times out. The receive-window
+# clamp is not available there. Announce a 536-byte MSS, the IPv4 minimum,
+# before connect. A window clamp is still attempted and widened only after the
+# certificate verifies.
+TCP_SEGMENT_CEILING = 536
 HANDSHAKE_WINDOW_BYTES = 536
 RESPONSE_WINDOW_BYTES = 65535
 UUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
@@ -229,6 +229,8 @@ class Store:
             return "unsupported"
         if isinstance(actual, int) and 0 < actual <= TCP_SEGMENT_CEILING:
             return str(actual)
+        if isinstance(actual, int):
+            return "rejected:" + str(actual)
         return "unsupported"
 
     def _window_option(self):
@@ -241,10 +243,12 @@ class Store:
         try:
             sock.setsockopt(socket.IPPROTO_TCP, option, HANDSHAKE_WINDOW_BYTES)
             actual = sock.getsockopt(socket.IPPROTO_TCP, option)
-        except OSError:
-            return "unsupported"
+        except OSError as exc:
+            return "oserror:" + type(exc).__name__
         if isinstance(actual, int) and 0 < actual <= HANDSHAKE_WINDOW_BYTES:
             return str(actual)
+        if isinstance(actual, int):
+            return "rejected:" + str(actual)
         return "unsupported"
 
     def _release_window(self, sock):
