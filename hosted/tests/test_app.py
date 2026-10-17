@@ -508,6 +508,8 @@ class ScriptedSocket:
             raise ConnectionRefusedError("synthetic-refuse")
 
     def sendall(self, data):
+        if self.mode == "reset-on-send":
+            raise ConnectionResetError("synthetic-reset-after-send")
         self.sent += data
         self.harness.sent.append(data)
         self.harness.events.append(("send",))
@@ -550,6 +552,12 @@ class ScriptedContext:
         if sock.mode == "tls-timeout":
             self.harness.advance(sock.timeout)
             raise TimeoutError("synthetic-tls")
+        if sock.mode == "tls-cert":
+            raise ssl.SSLCertVerificationError("certificate verify failed")
+        if sock.mode == "tls-reset":
+            raise ConnectionResetError("synthetic-reset")
+        if sock.mode == "tls-secret":
+            raise ssl.SSLError("failed " + ("b" * 32))
         return ScriptedSocket(self.harness, sock.mode)
 
 
@@ -690,6 +698,81 @@ class StoreTransportTests(unittest.TestCase):
                          [("connect", "203.0.113.1"), ("connect", "203.0.113.2")])
         self.assertEqual(harness.events.count(("send",)), 1)
         self.assertIn("result=tls_failure", logs)
+        self.assertIn("tls_class=handshake_timeout", logs)
+        self.assertIn("detail=synthetic-tls", logs)
+        self.assertIn("sni=example.account.workers.dev", logs)
+        self.assertRegex(logs, r"clock=\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+        self.assertNotIn("b" * 32, logs)
+
+    def test_tls_classes_stay_distinct_and_verification_stays_enabled(self):
+        store = Store("https://example.account.workers.dev", "b" * 32)
+        self.assertEqual(store._classify_tls(TimeoutError("synthetic-tls")), "handshake_timeout")
+        self.assertEqual(
+            store._classify_tls(ssl.SSLCertVerificationError("certificate verify failed")),
+            "certificate_validation",
+        )
+        self.assertEqual(
+            store._classify_tls(ssl.SSLError("CERTIFICATE_VERIFY_FAILED")),
+            "certificate_validation",
+        )
+        self.assertEqual(store._classify_tls(ConnectionResetError(104, "synthetic-reset")), "connection_reset")
+        self.assertEqual(store._classify_tls(OSError(10054, "forcibly closed")), "connection_reset")
+        self.assertEqual(store._classify_tls(ssl.SSLError("unexpected eof")), "tls_other")
+        self.assertEqual(store._sanitize_tls_detail(ssl.SSLError("failed " + ("b" * 32))), "failed_redacted")
+        context = ssl.create_default_context()
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
+    def test_certificate_validation_retries_the_next_address_before_send(self):
+        harness = TransportHarness(["tls-cert", "ok"])
+        harness.response('{"status":"available","schema_version":1,"receipt_minted":false}')
+        body, logs = self._run(harness, self._store(harness))
+        self.assertEqual(body["schema_version"], 1)
+        self.assertEqual([event for event in harness.events if event[0] == "connect"],
+                         [("connect", "203.0.113.1"), ("connect", "203.0.113.2")])
+        self.assertEqual(harness.events.count(("send",)), 1)
+        self.assertIn("tls_class=certificate_validation", logs)
+        self.assertIn("detail=certificate_verify_failed", logs)
+        self.assertIn("error=SSLCertVerificationError", logs)
+        self.assertIn("sni=example.account.workers.dev", logs)
+        self.assertRegex(logs, r"ca_sha256=(unavailable|unreadable|[0-9a-f]{64})")
+
+    def test_pre_send_connection_reset_retries_the_next_address(self):
+        harness = TransportHarness(["tls-reset", "ok"])
+        harness.response('{"status":"available","schema_version":1,"receipt_minted":false}')
+        body, logs = self._run(harness, self._store(harness))
+        self.assertEqual(body["schema_version"], 1)
+        self.assertEqual(harness.events.count(("send",)), 1)
+        self.assertEqual([event[1] for event in harness.events if event[0] == "connect"],
+                         ["203.0.113.1", "203.0.113.2"])
+        self.assertIn("tls_class=connection_reset", logs)
+        self.assertIn("detail=synthetic-reset", logs)
+        self.assertIn("phase=tls", logs)
+
+    def test_tls_detail_redacts_the_store_secret(self):
+        harness = TransportHarness(["tls-secret"], addresses=1)
+        body, logs = self._run(harness, self._store(harness))
+        self.assertIsInstance(body, ApiError)
+        self.assertEqual(body.reason, "tls_failure")
+        self.assertFalse(body.submitted)
+        self.assertEqual(harness.events.count(("send",)), 0)
+        self.assertIn("tls_class=tls_other", logs)
+        self.assertIn("detail=failed_redacted", logs)
+        self.assertNotIn("b" * 32, logs)
+
+    def test_connection_reset_after_send_does_not_try_another_address(self):
+        harness = TransportHarness(["reset-on-send", "ok"], addresses=2)
+        body, logs = self._run(harness, self._store(harness), "purge", owner="ab" * 32)
+        self.assertIsInstance(body, ApiError)
+        self.assertEqual(body.reason, "response_timeout")
+        self.assertTrue(body.submitted)
+        self.assertEqual([event for event in harness.events if event[0] == "connect"],
+                         [("connect", "203.0.113.1")])
+        self.assertNotIn(("send",), harness.events)
+        self.assertIn("phase=response", logs)
+        self.assertIn("result=response_timeout", logs)
+        self.assertIn("error=ConnectionResetError", logs)
+        self.assertNotIn("tls_class=connection_reset", logs)
         self.assertNotIn("b" * 32, logs)
 
     def test_segment_ceiling_is_applied_before_connect_and_verification_stays(self):
