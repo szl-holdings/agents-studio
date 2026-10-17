@@ -152,6 +152,8 @@ class Store:
         self.address_budget = address_budget
         self.read_budget = read_budget
         self._clock = time.monotonic
+        self._compared = False
+        self._compare_lock = threading.Lock()
         self.configured = (valid_store_url(url) and isinstance(secret, str)
                            and bool(re.fullmatch(r"[\x21-\x7e]{32,256}", secret)))
 
@@ -296,6 +298,12 @@ class Store:
             self._classify_tls(exc), self._sanitize_tls_detail(exc),
         )
 
+    def _timed_tls_failure(self, exc, started, context_ms, hs_started):
+        failure = self._tls_failure(exc, started)
+        failure.context_ms = context_ms
+        failure.handshake_ms = None if hs_started is None else self._elapsed(hs_started)
+        return failure
+
     def _tls_facts(self, host):
         paths = ssl.get_default_verify_paths()
         ca_file = paths.cafile or ""
@@ -311,6 +319,122 @@ class Store:
         clock = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         sni = host if isinstance(host, str) and host and not any(char.isspace() for char in host) else "unavailable"
         return {"sni": sni, "ca": name, "ca_sha256": digest, "clock": clock}
+
+    def _reuse_name(self, value):
+        if value is True:
+            return "true"
+        if value is False:
+            return "false"
+        return "unavailable"
+
+    def _require_verification(self, context):
+        return context.verify_mode == ssl.CERT_REQUIRED and bool(context.check_hostname)
+
+    def compare_once(self):
+        # One fresh pair per process. It uses the same destination, SNI, CA
+        # verification, and address budget as the writer, and it sends nothing.
+        if self._compared or not self.configured:
+            return
+        with self._compare_lock:
+            if self._compared:
+                return
+            self._compared = True
+            try:
+                self._compare()
+            except Exception as exc:
+                self._emit(secrets.token_hex(4), phase="compare", result="probe_error",
+                           error=type(exc).__name__)
+
+    def _compare(self):
+        host = urlsplit(self.url).hostname
+        correlation = secrets.token_hex(4)
+        info = None
+        for family in (socket.AF_INET, socket.AF_INET6):
+            try:
+                infos = socket.getaddrinfo(host, 443, family, socket.SOCK_STREAM)
+            except socket.gaierror as exc:
+                self._emit(correlation, family=self._family_name(family), phase="compare",
+                           result="dns_failure", error=type(exc).__name__)
+                continue
+            if infos:
+                info = infos[0]
+                break
+        if info is None:
+            return
+        for arm in ("standard", "custom"):
+            self._compare_arm(correlation, host, info, arm)
+
+    def _compare_arm(self, correlation, host, info, arm):
+        af, socktype, proto, _canon, sockaddr = info
+        family = self._family_name(af)
+        address_id = "0-" + hashlib.sha256(str(sockaddr[0]).encode()).hexdigest()[:8]
+        budget = self.address_budget
+        if af == socket.AF_INET6:
+            budget = min(budget, IPV6_BUDGET_SECONDS)
+        segment = "default"
+        window = "default"
+        sock = socket.socket(af, socktype, proto)
+        closer = sock
+        try:
+            if arm == "custom":
+                segment = self._limit_segment(sock)
+                window = self._limit_window(sock)
+            sock.settimeout(budget)
+            started = self._clock()
+            try:
+                sock.connect(sockaddr)
+            except (TimeoutError, OSError) as exc:
+                self._emit(correlation, family=family, phase="compare", arm=arm,
+                           ms=self._elapsed(started), address=address_id, segment=segment,
+                           window=window, result="connect_failure", error=type(exc).__name__,
+                           session_reused="unavailable", connection="new")
+                return
+            tls_started = self._clock()
+            tls_budget = (started + budget) - tls_started
+            if tls_budget <= 0:
+                self._emit(correlation, family=family, phase="compare", arm=arm, ms=0,
+                           address=address_id, segment=segment, window=window,
+                           result="tls_failure", error="TimeoutError",
+                           tls_class="handshake_timeout", session_reused="unavailable",
+                           connection="new", **self._tls_facts(host))
+                return
+            sock.settimeout(tls_budget)
+            context_ms = None
+            hs_started = None
+            try:
+                ctx_started = self._clock()
+                context = ssl.create_default_context()
+                context_ms = self._elapsed(ctx_started)
+                if not self._require_verification(context):
+                    self._emit(correlation, family=family, phase="compare", arm=arm,
+                               ms=self._elapsed(tls_started), context_ms=context_ms,
+                               address=address_id, segment=segment, window=window,
+                               result="refused", error="VerificationDisabled",
+                               session_reused="unavailable", connection="new",
+                               **self._tls_facts(host))
+                    return
+                hs_started = self._clock()
+                closer = context.wrap_socket(sock, server_hostname=host)
+                handshake_ms = self._elapsed(hs_started)
+            except (TimeoutError, OSError, ssl.SSLError) as exc:
+                failure = self._tls_failure(exc, tls_started)
+                self._emit(correlation, family=family, phase="compare", arm=arm,
+                           ms=failure.elapsed_ms, context_ms=context_ms,
+                           handshake_ms=None if hs_started is None else self._elapsed(hs_started),
+                           address=address_id, segment=segment, window=window,
+                           result=failure.reason, error=failure.error_name,
+                           tls_class=failure.tls_class, detail=failure.detail,
+                           session_reused="unavailable", connection="new",
+                           **self._tls_facts(host))
+                return
+            self._emit(correlation, family=family, phase="compare", arm=arm,
+                       ms=self._elapsed(tls_started), context_ms=context_ms,
+                       handshake_ms=handshake_ms, address=address_id, segment=segment,
+                       window=window, result="verified",
+                       session_reused=self._reuse_name(getattr(closer, "session_reused", None)),
+                       connection="new", **self._tls_facts(host))
+        finally:
+            closer.close()
 
     def _one_address(self, op, data, host, family, info, index, remaining, correlation):
         af, socktype, proto, _canon, sockaddr = info
@@ -340,16 +464,26 @@ class Store:
                 raise StoreFailure("tls_failure", False, "tls", 0, "TimeoutError",
                                    "handshake_timeout", "TimeoutError")
             sock.settimeout(tls_budget)
+            context_ms = None
+            hs_started = None
             try:
+                ctx_started = self._clock()
                 context = ssl.create_default_context()
+                context_ms = self._elapsed(ctx_started)
+                if not self._require_verification(context):
+                    raise ssl.SSLCertVerificationError("verification disabled")
+                hs_started = self._clock()
                 closer = context.wrap_socket(sock, server_hostname=host)
+                handshake_ms = self._elapsed(hs_started)
             except TimeoutError as exc:
-                raise self._tls_failure(exc, tls_started) from None
+                raise self._timed_tls_failure(exc, tls_started, context_ms, hs_started) from None
             except (OSError, ssl.SSLError) as exc:
-                raise self._tls_failure(exc, tls_started) from None
+                raise self._timed_tls_failure(exc, tls_started, context_ms, hs_started) from None
             self._emit(correlation, family=self._family_name(family), phase="tls",
-                       ms=self._elapsed(tls_started), address=address_id, result="verified",
-                       **self._tls_facts(host))
+                       ms=self._elapsed(tls_started), context_ms=context_ms,
+                       handshake_ms=handshake_ms, address=address_id, result="verified",
+                       session_reused=self._reuse_name(getattr(closer, "session_reused", None)),
+                       connection="new", **self._tls_facts(host))
             self._release_window(closer)
             return self._submit(closer, op, data, correlation, family, address_id)
         except StoreFailure as failure:
@@ -360,6 +494,12 @@ class Store:
                 extra["detail"] = failure.detail
             if failure.phase == "tls":
                 extra.update(self._tls_facts(host))
+                extra["session_reused"] = "unavailable"
+                extra["connection"] = "new"
+                if getattr(failure, "context_ms", None) is not None:
+                    extra["context_ms"] = failure.context_ms
+                if getattr(failure, "handshake_ms", None) is not None:
+                    extra["handshake_ms"] = failure.handshake_ms
             self._emit(correlation, family=self._family_name(family), phase=failure.phase,
                        ms=failure.elapsed_ms, address=address_id, result=failure.reason,
                        error=failure.error_name, **extra)
@@ -520,8 +660,10 @@ class Store:
                 "python_threads": threading.active_count()}
 
     def _emit(self, correlation, **fields):
-        order = ("family", "phase", "ms", "addresses", "address", "segment", "window", "result", "error",
+        order = ("family", "phase", "arm", "ms", "context_ms", "handshake_ms", "addresses",
+                 "address", "segment", "window", "result", "error",
                  "tls_class", "detail", "sni", "ca", "ca_sha256", "clock",
+                 "session_reused", "connection",
                  "proxy_env", "trust_env", "direct", "rss_kb", "proc_threads", "python_threads")
         parts = [f"store_transport correlation={correlation}"]
         for key in order:
@@ -591,6 +733,13 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
         return user
 
     def store_diagnostic():
+        compare = getattr(store, "compare_once", None)
+        if compare is not None:
+            try:
+                compare()
+            except Exception as exc:
+                print("store_transport correlation=compare phase=compare result=probe_error error="
+                      + type(exc).__name__, file=sys.stderr, flush=True)
         try:
             result = store.call("check")
         except ApiError as exc:

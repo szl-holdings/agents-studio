@@ -367,6 +367,42 @@ class HostedAppTests(unittest.TestCase):
         self.assertEqual([op for op, _ in self.store.calls].count("check"), 2)
         self.assertNotIn("store_failure", self.client.get("/api/session", **self.base).json)
 
+    def test_readiness_asks_for_the_comparison_before_the_check(self):
+        class ComparingStore(FakeStore):
+            def __init__(self):
+                super().__init__()
+                self.order = []
+
+            def compare_once(self):
+                self.order.append("compare")
+
+            def call(self, op, **data):
+                self.order.append(op)
+                return super().call(op, **data)
+
+        store = ComparingStore()
+        self.rebuild(store)
+        self.assertEqual(self.client.get("/readyz", **self.base).status_code, 200)
+        self.assertEqual(self.client.get("/api/session", **self.base).status_code, 200)
+        self.assertEqual(store.order[:4], ["compare", "check", "compare", "check"])
+
+    def test_probe_exception_does_not_block_readiness_or_leak(self):
+        class ExplodingStore(FakeStore):
+            def compare_once(self):
+                raise RuntimeError("synthetic " + ("b" * 32))
+
+        store = ExplodingStore()
+        self.rebuild(store)
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", stderr):
+            response = self.client.get("/readyz", **self.base)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([op for op, _data in store.calls], ["check"])
+        logs = stderr.getvalue()
+        self.assertIn("result=probe_error", logs)
+        self.assertIn("error=RuntimeError", logs)
+        self.assertNotIn("b" * 32, logs)
+
     def test_schema_mismatch_stays_unready(self):
         class SchemaStore(FakeStore):
             def call(self, op, **data):
@@ -481,6 +517,7 @@ class ScriptedSocket:
         self.timeout = None
         self.sent = b""
         self.options = {}
+        self.session_reused = False
 
     def settimeout(self, value):
         self.timeout = value
@@ -546,6 +583,8 @@ class ScriptedSocket:
 class ScriptedContext:
     def __init__(self, harness):
         self.harness = harness
+        self.verify_mode = ssl.CERT_REQUIRED
+        self.check_hostname = True
 
     def wrap_socket(self, sock, server_hostname):
         self.harness.events.append(("tls", server_hostname))
@@ -924,6 +963,141 @@ class StoreTransportTests(unittest.TestCase):
         self.assertEqual(result.reason, "invalid_response")
         self.assertTrue(result.submitted)
         self.assertEqual(harness.events.count(("send",)), 1)
+
+    def test_handshake_comparison_records_split_times_without_a_payload(self):
+        option = 10
+        with mock.patch.object(socket, "TCP_WINDOW_CLAMP", option, create=True):
+            harness = TransportHarness(["ok", "ok"], addresses=1)
+            store = self._store(harness)
+            stderr = io.StringIO()
+
+            def context():
+                harness.advance(0.012)
+                base = ScriptedContext(harness)
+                original = base.wrap_socket
+
+                def wrap_socket(sock, server_hostname):
+                    harness.advance(0.034)
+                    peer = original(sock, server_hostname)
+                    peer.session_reused = harness.events.count(("tls", server_hostname)) > 1
+                    return peer
+
+                base.wrap_socket = wrap_socket
+                return base
+
+            with (harness.patch()[0], mock.patch("app.ssl.create_default_context", context),
+                  mock.patch("sys.stderr", stderr)):
+                store.compare_once()
+                store.compare_once()
+        logs = stderr.getvalue()
+        connects = [event for event in harness.events if event[0] == "connect"]
+        self.assertEqual(connects, [("connect", "203.0.113.1"), ("connect", "203.0.113.1")])
+        self.assertEqual(harness.events.count(("send",)), 0)
+        self.assertEqual(harness.sent, [])
+        first_connect = harness.events.index(("connect", "203.0.113.1"))
+        second_connect = harness.events.index(("connect", "203.0.113.1"), first_connect + 1)
+        segment = ("segment", socket.IPPROTO_TCP, socket.TCP_MAXSEG, TCP_SEGMENT_CEILING)
+        window = ("window", socket.IPPROTO_TCP, option, HANDSHAKE_WINDOW_BYTES)
+        self.assertNotIn(segment, harness.events[:first_connect])
+        self.assertNotIn(window, harness.events[:first_connect])
+        self.assertLess(first_connect, harness.events.index(segment))
+        self.assertLess(harness.events.index(segment), second_connect)
+        self.assertLess(harness.events.index(window), second_connect)
+        self.assertEqual(harness.events.count(segment), 1)
+        self.assertEqual([event for event in harness.events if event[0] == "tls"], [
+            ("tls", "example.account.workers.dev"),
+            ("tls", "example.account.workers.dev"),
+        ])
+        self.assertEqual(logs.count("arm=standard"), 1)
+        self.assertEqual(logs.count("arm=custom"), 1)
+        self.assertIn("family=ipv4", logs)
+        self.assertIn("context_ms=12", logs)
+        self.assertIn("handshake_ms=34", logs)
+        self.assertIn("session_reused=false", logs)
+        self.assertIn("session_reused=true", logs)
+        self.assertIn("connection=new", logs)
+        self.assertIn("segment=default", logs)
+        self.assertIn(f"segment={TCP_SEGMENT_CEILING}", logs)
+        self.assertIn("window=default", logs)
+        self.assertIn(f"window={HANDSHAKE_WINDOW_BYTES}", logs)
+        self.assertIn("sni=example.account.workers.dev", logs)
+        self.assertNotIn("203.0.113.1", logs)
+        self.assertNotIn("Authorization", logs)
+        self.assertNotIn("b" * 32, logs)
+        self.assertNotIn("phase=response", logs)
+        self.assertEqual(store.connect_budget, 8)
+        self.assertEqual(store.address_budget, 3)
+        self.assertEqual(store.read_budget, 15)
+        verified = ssl.create_default_context()
+        self.assertTrue(store._require_verification(verified))
+
+    def test_comparison_refuses_a_context_that_does_not_verify(self):
+        harness = TransportHarness(["ok", "ok"], addresses=1)
+        store = self._store(harness)
+
+        def context():
+            base = ScriptedContext(harness)
+
+            def wrap_socket(_sock, _server_hostname):
+                raise AssertionError("disabled verification was used")
+
+            base.verify_mode = ssl.CERT_NONE
+            base.wrap_socket = wrap_socket
+            return base
+
+        stderr = io.StringIO()
+        with (harness.patch()[0], mock.patch("app.ssl.create_default_context", context),
+              mock.patch("sys.stderr", stderr)):
+            store.compare_once()
+        logs = stderr.getvalue()
+        self.assertEqual(logs.count("result=refused"), 2)
+        self.assertIn("error=VerificationDisabled", logs)
+        self.assertNotIn(("tls", "example.account.workers.dev"), harness.events)
+        self.assertEqual(harness.events.count(("send",)), 0)
+        self.assertEqual([event for event in harness.events if event[0] == "connect"],
+                         [("connect", "203.0.113.1"), ("connect", "203.0.113.1")])
+
+    def test_comparison_timeout_does_not_submit_or_replace_the_real_write(self):
+        harness = TransportHarness(["tls-timeout", "tls-timeout", "ok"], addresses=1)
+        harness.response('{"status":"available","schema_version":1,"receipt_minted":false}')
+        store = self._store(harness)
+        stderr = io.StringIO()
+        patches = harness.patch()
+        with patches[0], patches[1], mock.patch("sys.stderr", stderr):
+            store.compare_once()
+            body = store.call("check")
+        logs = stderr.getvalue()
+        self.assertEqual(body["schema_version"], 1)
+        self.assertFalse(getattr(body, "submitted", False))
+        self.assertEqual(harness.events.count(("send",)), 1)
+        self.assertEqual(logs.count("arm=standard"), 1)
+        self.assertEqual(logs.count("arm=custom"), 1)
+        self.assertIn("context_ms=0", logs)
+        self.assertIn("handshake_ms=3000", logs)
+        self.assertIn("tls_class=handshake_timeout", logs)
+        self.assertNotIn("Authorization", logs)
+        self.assertNotIn("b" * 32, logs)
+        self.assertNotIn("receipt_minted", logs)
+        segment = ("segment", socket.IPPROTO_TCP, socket.TCP_MAXSEG, TCP_SEGMENT_CEILING)
+        self.assertEqual(harness.events.count(segment), 2)
+
+    def test_comparison_redacts_a_secret_and_still_sends_the_real_write_once(self):
+        harness = TransportHarness(["tls-secret", "ok", "ok"], addresses=1)
+        harness.response('{"status":"available","schema_version":1,"receipt_minted":false}')
+        store = self._store(harness)
+        stderr = io.StringIO()
+        patches = harness.patch()
+        with patches[0], patches[1], mock.patch("sys.stderr", stderr):
+            store.compare_once()
+            body = store.call("check")
+        logs = stderr.getvalue()
+        self.assertEqual(body["schema_version"], 1)
+        self.assertEqual(harness.events.count(("send",)), 1)
+        self.assertIn("detail=failed_redacted", logs)
+        self.assertIn("arm=custom", logs)
+        self.assertIn("result=verified", logs)
+        self.assertNotIn("b" * 32, logs)
+        self.assertNotIn("Authorization", logs)
 
     def test_concurrent_readiness_checks_are_not_serialized(self):
         store = Store("https://example.account.workers.dev", "b" * 32)
