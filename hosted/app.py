@@ -54,13 +54,16 @@ class ApiError(Exception):
 
 
 class StoreFailure(Exception):
-    def __init__(self, reason, submitted, phase, elapsed_ms, error_name):
+    def __init__(self, reason, submitted, phase, elapsed_ms, error_name,
+                 tls_class=None, detail=None):
         super().__init__(reason)
         self.reason = reason
         self.submitted = submitted
         self.phase = phase
         self.elapsed_ms = elapsed_ms
         self.error_name = error_name
+        self.tls_class = tls_class
+        self.detail = detail
 
 
 class ProviderSession(OAuth2Session):
@@ -260,6 +263,55 @@ class Store:
         except OSError:
             return
 
+    def _classify_tls(self, exc):
+        if isinstance(exc, ssl.SSLCertVerificationError):
+            return "certificate_validation"
+        if isinstance(exc, ssl.SSLError):
+            text = f"{getattr(exc, 'reason', '')} {exc}".upper()
+            if "CERTIFICATE" in text or "VERIFY FAILED" in text:
+                return "certificate_validation"
+            return "tls_other"
+        if isinstance(exc, ConnectionResetError) or getattr(exc, "errno", None) in {104, 54, 10054}:
+            return "connection_reset"
+        if isinstance(exc, TimeoutError):
+            return "handshake_timeout"
+        return "tls_other"
+
+    def _sanitize_tls_detail(self, exc):
+        text = " ".join(str(exc).split())
+        if self.secret and self.secret in text:
+            text = text.replace(self.secret, "redacted")
+        kept = []
+        for char in text:
+            if char.isascii() and (char.isalnum() or char in "._:/=+-"):
+                kept.append(char)
+            else:
+                kept.append("_")
+        detail = re.sub(r"_+", "_", "".join(kept)).strip("_")[:80]
+        return detail or type(exc).__name__
+
+    def _tls_failure(self, exc, started):
+        return StoreFailure(
+            "tls_failure", False, "tls", self._elapsed(started), type(exc).__name__,
+            self._classify_tls(exc), self._sanitize_tls_detail(exc),
+        )
+
+    def _tls_facts(self, host):
+        paths = ssl.get_default_verify_paths()
+        ca_file = paths.cafile or ""
+        digest = "unavailable"
+        try:
+            if ca_file:
+                digest = hashlib.sha256(Path(ca_file).read_bytes()).hexdigest()
+        except OSError:
+            digest = "unreadable"
+        name = Path(ca_file).name if ca_file else "unavailable"
+        if any(char.isspace() for char in name):
+            name = "unavailable"
+        clock = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        sni = host if isinstance(host, str) and host and not any(char.isspace() for char in host) else "unavailable"
+        return {"sni": sni, "ca": name, "ca_sha256": digest, "clock": clock}
+
     def _one_address(self, op, data, host, family, info, index, remaining, correlation):
         af, socktype, proto, _canon, sockaddr = info
         address_id = f"{index}-" + hashlib.sha256(str(sockaddr[0]).encode()).hexdigest()[:8]
@@ -285,25 +337,32 @@ class Store:
             tls_started = self._clock()
             tls_budget = (started + budget) - tls_started
             if tls_budget <= 0:
-                raise StoreFailure("tls_failure", False, "tls", 0, "TimeoutError")
+                raise StoreFailure("tls_failure", False, "tls", 0, "TimeoutError",
+                                   "handshake_timeout", "TimeoutError")
             sock.settimeout(tls_budget)
             try:
                 context = ssl.create_default_context()
                 closer = context.wrap_socket(sock, server_hostname=host)
             except TimeoutError as exc:
-                raise StoreFailure("tls_failure", False, "tls", self._elapsed(tls_started),
-                                   type(exc).__name__) from None
+                raise self._tls_failure(exc, tls_started) from None
             except (OSError, ssl.SSLError) as exc:
-                raise StoreFailure("tls_failure", False, "tls", self._elapsed(tls_started),
-                                   type(exc).__name__) from None
+                raise self._tls_failure(exc, tls_started) from None
             self._emit(correlation, family=self._family_name(family), phase="tls",
-                       ms=self._elapsed(tls_started), address=address_id, result="verified")
+                       ms=self._elapsed(tls_started), address=address_id, result="verified",
+                       **self._tls_facts(host))
             self._release_window(closer)
             return self._submit(closer, op, data, correlation, family, address_id)
         except StoreFailure as failure:
+            extra = {}
+            if failure.tls_class:
+                extra["tls_class"] = failure.tls_class
+            if failure.detail:
+                extra["detail"] = failure.detail
+            if failure.phase == "tls":
+                extra.update(self._tls_facts(host))
             self._emit(correlation, family=self._family_name(family), phase=failure.phase,
                        ms=failure.elapsed_ms, address=address_id, result=failure.reason,
-                       error=failure.error_name)
+                       error=failure.error_name, **extra)
             return failure
         finally:
             closer.close()
@@ -462,6 +521,7 @@ class Store:
 
     def _emit(self, correlation, **fields):
         order = ("family", "phase", "ms", "addresses", "address", "segment", "window", "result", "error",
+                 "tls_class", "detail", "sni", "ca", "ca_sha256", "clock",
                  "proxy_env", "trust_env", "direct", "rss_kb", "proc_threads", "python_threads")
         parts = [f"store_transport correlation={correlation}"]
         for key in order:
