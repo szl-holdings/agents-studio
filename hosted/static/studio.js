@@ -9,6 +9,9 @@ let sequence = 0;
 
 function icons() { window.lucide?.createIcons(); }
 function notice(message = "") { $("notice").textContent = message; $("notice").hidden = !message; }
+function reportLoad(error) {
+  notice(session?.store_failure ? storageMessage(session.store_failure) : friendly(error));
+}
 function controls() {
   const signedIn = Boolean(session?.user);
   const ready = signedIn && session?.ready?.auth && session?.ready?.store && session?.ready?.model;
@@ -23,8 +26,22 @@ function controls() {
   $("delete-account").disabled = busy;
   $("export").disabled = !snapshot || busy;
   $("identity").textContent = session?.user?.name || "Not signed in";
-  $("status").textContent = busy ? "Running" : ready ? "Available" : signedIn ? "Unavailable" : "Sign in";
-  $("status").classList.toggle("error", signedIn && !ready);
+  const storageDown = Boolean(session?.store_failure);
+  $("status").textContent = busy ? "Running" : ready ? "Available"
+    : storageDown ? "Storage unavailable" : signedIn ? "Unavailable" : "Sign in";
+  $("status").classList.toggle("error", (signedIn && !ready) || storageDown);
+}
+function storageMessage(failure) {
+  const messages = {
+    missing_configuration: "Storage is not configured. Chat stays unavailable.",
+    dns_failure: "Storage could not be resolved. Chat stays unavailable.",
+    connect_failure: "Storage could not be reached. Chat stays unavailable.",
+    tls_failure: "Storage could not complete a verified connection. Chat stays unavailable.",
+    response_timeout: "Storage did not answer in time. Chat stays unavailable.",
+    invalid_response: "Storage returned an unusable response. Chat stays unavailable.",
+    schema_mismatch: "Storage schema does not match this application. Chat stays unavailable.",
+  };
+  return messages[failure] || "Storage is temporarily unavailable. Chat stays unavailable.";
 }
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -48,6 +65,7 @@ function friendly(error) {
     authentication_required: "Please sign in again.",
     model_unavailable: "The model is not available yet. Your history remains saved.",
     store_unavailable: "Saved history is unavailable. No generation will be started.",
+    erasure_uncertain: "The deletion outcome is uncertain. It was not retried. Refresh before trying again.",
     conversation_pending: "This conversation has an unresolved run. Refresh to check its saved status.",
   };
   return messages[error.message] || "The request did not finish normally. Refresh to check its saved status before starting another run.";
@@ -102,6 +120,7 @@ async function openConversation(id) {
 async function reload() {
   session = await api("/api/session");
   controls();
+  notice(session.store_failure ? storageMessage(session.store_failure) : "");
   if (session.user) {
     const data = await api("/api/conversations");
     conversations = data.conversations;
@@ -123,7 +142,7 @@ $("new").onclick = async () => {
   notice();
   try { await createConversation(); $("prompt").focus(); } catch (error) { notice(friendly(error)); }
 };
-$("refresh").onclick = () => { if (!busy) reload().then(() => notice()).catch((e) => notice(friendly(e))); };
+$("refresh").onclick = () => { if (!busy) reload().catch(reportLoad); };
 $("menu").onclick = () => document.body.classList.toggle("menu-open");
 $("search").oninput = renderList;
 $("prompt").oninput = () => { $("counter").textContent = `${$("prompt").value.length} / 2,000`; controls(); };
@@ -175,4 +194,4 @@ $("export").onclick = () => {
   link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
 };
 icons();
-reload().catch((error) => { notice(friendly(error)); controls(); });
+reload().catch((error) => { reportLoad(error); controls(); });

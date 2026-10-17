@@ -7,18 +7,15 @@ import os
 import re
 import secrets
 import socket
+import ssl
 import sys
 import threading
 import time
-import traceback
 import uuid
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import requests
-from urllib3.util import connection as urllib3_connection
-from urllib3.exceptions import MaxRetryError, NewConnectionError
 from authlib.integrations.flask_client import OAuth
 from authlib.integrations.requests_client import OAuth2Session
 from flask import Flask, jsonify, redirect, request, session
@@ -30,16 +27,32 @@ ISSUER = "https://huggingface.co"
 SESSION_SECONDS = 8 * 60 * 60
 MAX_BODY_BYTES = 16384
 MAX_STORE_RESPONSE_BYTES = 2 * 1024 * 1024
+CONNECT_BUDGET_SECONDS = 8
+ADDRESS_BUDGET_SECONDS = 3
+IPV6_BUDGET_SECONDS = 1
+READ_BUDGET_SECONDS = 15
 UUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 LIMITS = {"prompt_characters": 2000, "output_tokens": MAX_OUTPUT_TOKENS,
           "daily_user_runs": 20, "daily_global_runs": 200, "conversations": 100}
 
 
 class ApiError(Exception):
-    def __init__(self, code, status=400):
+    def __init__(self, code, status=400, reason=None, submitted=False):
         super().__init__(code)
         self.code = code
         self.status = status
+        self.reason = reason
+        self.submitted = submitted
+
+
+class StoreFailure(Exception):
+    def __init__(self, reason, submitted, phase, elapsed_ms, error_name):
+        super().__init__(reason)
+        self.reason = reason
+        self.submitted = submitted
+        self.phase = phase
+        self.elapsed_ms = elapsed_ms
+        self.error_name = error_name
 
 
 class ProviderSession(OAuth2Session):
@@ -76,118 +89,331 @@ def valid_store_url(value):
     return bool(re.fullmatch(r"[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev", host))
 
 
-class Store:
-    _dns_lock = threading.Lock()
+def decode_store_response(raw):
+    if not isinstance(raw, (bytes, bytearray)) or b"\r\n\r\n" not in raw:
+        raise ApiError("store_unavailable", 503, reason="invalid_response")
+    head, body = raw.split(b"\r\n\r\n", 1)
+    if len(head) > 65536 or len(body) > MAX_STORE_RESPONSE_BYTES:
+        raise ApiError("store_unavailable", 503, reason="invalid_response")
+    lines = head.decode("iso-8859-1").split("\r\n")
+    parts = lines[0].split(" ", 2)
+    if len(parts) < 2 or not parts[1].isdigit():
+        raise ApiError("store_unavailable", 503, reason="invalid_response")
+    headers = {}
+    for line in lines[1:]:
+        if ":" not in line:
+            raise ApiError("store_unavailable", 503, reason="invalid_response")
+        name, value = line.split(":", 1)
+        headers.setdefault(name.strip().lower(), value.strip())
+    if headers.get("content-type", "").split(";")[0].strip() != "application/json":
+        raise ApiError("store_unavailable", 503, reason="invalid_response")
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        raise ApiError("store_unavailable", 503, reason="invalid_response") from None
+    if not isinstance(payload, dict):
+        raise ApiError("store_unavailable", 503, reason="invalid_response")
+    status = int(parts[1])
+    if status != 200:
+        aliases = {"not_found": "not_found",
+                   "idempotency_conflict": "idempotency_conflict",
+                   "conversation_unresolved": "conversation_pending",
+                   "conversation_limit": "quota_exceeded",
+                   "conversation_run_limit": "quota_exceeded",
+                   "user_daily_limit": "quota_exceeded",
+                   "global_daily_limit": "quota_exceeded",
+                   "context_changed": "context_changed"}
+        if status not in {400, 404, 409, 413, 429}:
+            raise ApiError("store_unavailable", 503, reason="invalid_response")
+        code = aliases.get(payload.get("error"))
+        if code is None:
+            raise ApiError("store_unavailable", 503, reason="invalid_response")
+        raise ApiError(code, status)
+    return payload
 
-    def __init__(self, url, secret):
+
+class Store:
+    def __init__(self, url, secret, *, connect_budget=CONNECT_BUDGET_SECONDS,
+                 address_budget=ADDRESS_BUDGET_SECONDS, read_budget=READ_BUDGET_SECONDS):
         self.url = url
         self.secret = secret
+        self.connect_budget = connect_budget
+        self.address_budget = address_budget
+        self.read_budget = read_budget
+        self._clock = time.monotonic
         self.configured = (valid_store_url(url) and isinstance(secret, str)
                            and bool(re.fullmatch(r"[\x21-\x7e]{32,256}", secret)))
 
     def call(self, op, **data):
         if not self.configured:
-            raise ApiError("store_unavailable", 503)
-        # On this Space, one address family fails immediately and the other
-        # consumes a 3.05s connect budget. Try IPv6 first, then IPv4 longer.
-        # The lock keeps one call from restoring dual-stack DNS under another.
-        with self._dns_lock:
-            for family, timeout in ((socket.AF_INET6, (1, 15)), (socket.AF_INET, (8, 15))):
-                try:
-                    return self._post(op, data, family, timeout)
-                except requests.RequestException as exc:
-                    print("store_transport_failed "
-                          f"family={family} error={type(exc).__name__} "
-                          f"{self._failure_diagnostic(exc)}",
-                          file=sys.stderr, flush=True)
-                    # A mutation may already have committed when its response is lost.
-                    # Only replay reads, or failures known to precede request dispatch.
-                    if not self._retry_safe(op, exc):
-                        raise ApiError("store_unavailable", 503) from None
-            raise ApiError("store_unavailable", 503)
+            raise ApiError("store_unavailable", 503, reason="missing_configuration")
+        correlation = secrets.token_hex(4)
+        self._emit(correlation, phase="config", result="direct", proxy_env=self._proxy_env(),
+                   trust_env="false", direct="true", **self._pressure())
+        # IPv6 on this Space fails before TCP. IPv4 can accept TCP and then stall
+        # in TLS. urllib3 reports that stall as ReadTimeout and does not try the
+        # next address. A response timeout can also follow a committed write.
+        # Another address is used only before the request bytes are written.
+        deadline = self._clock() + self.connect_budget
+        last = None
+        for family in (socket.AF_INET6, socket.AF_INET):
+            if self._clock() >= deadline:
+                break
+            # This Space's IPv6 path fails before TCP. Keep that attempt inside
+            # the old 1s cap so it cannot consume the IPv4 connect budget.
+            family_deadline = deadline
+            if family == socket.AF_INET6:
+                family_deadline = min(deadline, self._clock() + IPV6_BUDGET_SECONDS)
+            try:
+                return self._exchange(op, data, family, family_deadline, correlation)
+            except StoreFailure as failure:
+                if failure.submitted:
+                    raise ApiError("store_unavailable", 503, reason=failure.reason,
+                                   submitted=True) from None
+                last = failure
+        reason = last.reason if last is not None else "connect_failure"
+        raise ApiError("store_unavailable", 503, reason=reason)
 
-    @staticmethod
-    def _failure_diagnostic(exc):
-        """Versions and exception-chain function names. No message or headers."""
-        import urllib3
-        labels = []
-        current = exc
-        seen = set()
-        while current is not None and len(seen) < 8 and id(current) not in seen:
-            seen.add(id(current))
-            labels.append(type(current).__name__)
-            tb = current.__traceback__
-            if tb is not None:
-                for frame in traceback.extract_tb(tb)[-12:]:
-                    name = frame.name or ""
-                    if name in {"<lambda>", "<module>"} or re.fullmatch(
-                            r"[A-Za-z_][A-Za-z0-9_]{0,80}", name):
-                        labels.append(name)
-            if current.__cause__ is not None:
-                current = current.__cause__
-            elif current.__suppress_context__:
-                current = None
-            else:
-                current = current.__context__
-        return (f"requests={requests.__version__} urllib3={urllib3.__version__} "
-                f"chain={','.join(labels)}")
-
-    @staticmethod
-    def _retry_safe(op, exc):
-        if op in {"check", "list", "get"} or isinstance(exc, requests.ConnectTimeout):
-            return True
-        # Requests wraps urllib3 connection-establishment failures this way.
-        # A bare ConnectionError or a ProtocolError can occur after a commit.
-        wrapped = exc.args[0] if len(exc.args) == 1 else None
-        return (isinstance(exc, requests.ConnectionError)
-                and isinstance(wrapped, MaxRetryError)
-                and isinstance(wrapped.reason, NewConnectionError))
-
-    def _post(self, op, data, family, timeout):
-        previous_family = urllib3_connection.allowed_gai_family
-        urllib3_connection.allowed_gai_family = lambda: family
+    def _exchange(self, op, data, family, deadline, correlation):
+        host = urlsplit(self.url).hostname
+        started = self._clock()
         try:
-            # A new client avoids sharing mutable cookies or adapters across threads.
-            with requests.Session() as client:
-                client.trust_env = False
-                with client.post(self.url + "/v1/store", json={"op": op, **data},
-                                 headers={"Authorization": "Bearer " + self.secret,
-                                          "Accept": "application/json"},
-                                 timeout=timeout, allow_redirects=False, stream=True) as response:
-                    if response.status_code not in {200, 400, 404, 409, 413, 429}:
-                        raise ApiError("store_unavailable", 503)
-                    if response.headers.get("content-type", "").split(";")[0] != "application/json":
-                        raise ApiError("store_unavailable", 503)
-                    content = bytearray()
-                    for chunk in response.iter_content(chunk_size=16384):
-                        content.extend(chunk)
-                        if len(content) > MAX_STORE_RESPONSE_BYTES:
-                            raise ApiError("store_unavailable", 503)
-                    body = json.loads(content)
-                    if not isinstance(body, dict):
-                        raise ApiError("store_unavailable", 503)
-                    if response.status_code != 200:
-                        aliases = {"not_found": "not_found",
-                                   "idempotency_conflict": "idempotency_conflict",
-                                   "conversation_unresolved": "conversation_pending",
-                                   "conversation_limit": "quota_exceeded",
-                                   "conversation_run_limit": "quota_exceeded",
-                                   "user_daily_limit": "quota_exceeded",
-                                   "global_daily_limit": "quota_exceeded",
-                                   "context_changed": "context_changed"}
-                        code = aliases.get(body.get("error"))
-                        if code is None:
-                            raise ApiError("store_unavailable", 503)
-                        raise ApiError(code, response.status_code)
-                    return body
-        except ApiError:
-            raise
-        except requests.RequestException:
-            raise
-        except (ValueError, TypeError):
-            raise ApiError("store_unavailable", 503) from None
+            infos = socket.getaddrinfo(host, 443, family, socket.SOCK_STREAM)
+        except socket.gaierror as exc:
+            failure = StoreFailure("dns_failure", False, "dns", self._elapsed(started),
+                                   type(exc).__name__)
+            self._emit(correlation, family=self._family_name(family), phase="dns",
+                       ms=failure.elapsed_ms, result=failure.reason, error=failure.error_name)
+            raise failure from None
+        self._emit(correlation, family=self._family_name(family), phase="dns",
+                   ms=self._elapsed(started), addresses=len(infos), result="ok")
+        if not infos:
+            failure = StoreFailure("dns_failure", False, "dns", self._elapsed(started), "EmptyResult")
+            self._emit(correlation, family=self._family_name(family), phase="dns",
+                       ms=failure.elapsed_ms, result=failure.reason, error=failure.error_name)
+            raise failure
+        last = None
+        for index, info in enumerate(infos):
+            remaining = deadline - self._clock()
+            if remaining <= 0:
+                break
+            outcome = self._one_address(op, data, host, family, info, index, remaining, correlation)
+            if not isinstance(outcome, StoreFailure):
+                return outcome
+            if outcome.submitted:
+                raise outcome
+            last = outcome
+        if last is not None:
+            raise last
+        failure = StoreFailure("connect_failure", False, "budget", self._elapsed(started), "TimeoutError")
+        self._emit(correlation, family=self._family_name(family), phase="budget",
+                   ms=failure.elapsed_ms, result=failure.reason, error=failure.error_name)
+        raise failure
+
+    def _one_address(self, op, data, host, family, info, index, remaining, correlation):
+        af, socktype, proto, _canon, sockaddr = info
+        address_id = f"{index}-" + hashlib.sha256(str(sockaddr[0]).encode()).hexdigest()[:8]
+        budget = min(self.address_budget, remaining)
+        started = self._clock()
+        sock = socket.socket(af, socktype, proto)
+        closer = sock
+        try:
+            sock.settimeout(budget)
+            try:
+                sock.connect(sockaddr)
+            except TimeoutError as exc:
+                raise StoreFailure("connect_failure", False, "tcp", self._elapsed(started),
+                                   type(exc).__name__) from None
+            except OSError as exc:
+                raise StoreFailure("connect_failure", False, "tcp", self._elapsed(started),
+                                   type(exc).__name__) from None
+            self._emit(correlation, family=self._family_name(family), phase="tcp",
+                       ms=self._elapsed(started), address=address_id, result="connected")
+            tls_started = self._clock()
+            tls_budget = (started + budget) - tls_started
+            if tls_budget <= 0:
+                raise StoreFailure("tls_failure", False, "tls", 0, "TimeoutError")
+            sock.settimeout(tls_budget)
+            try:
+                context = ssl.create_default_context()
+                closer = context.wrap_socket(sock, server_hostname=host)
+            except TimeoutError as exc:
+                raise StoreFailure("tls_failure", False, "tls", self._elapsed(tls_started),
+                                   type(exc).__name__) from None
+            except (OSError, ssl.SSLError) as exc:
+                raise StoreFailure("tls_failure", False, "tls", self._elapsed(tls_started),
+                                   type(exc).__name__) from None
+            self._emit(correlation, family=self._family_name(family), phase="tls",
+                       ms=self._elapsed(tls_started), address=address_id, result="verified")
+            return self._submit(closer, op, data, correlation, family, address_id)
+        except StoreFailure as failure:
+            self._emit(correlation, family=self._family_name(family), phase=failure.phase,
+                       ms=failure.elapsed_ms, address=address_id, result=failure.reason,
+                       error=failure.error_name)
+            return failure
         finally:
-            urllib3_connection.allowed_gai_family = previous_family
+            closer.close()
+
+    def _submit(self, tls, op, data, correlation, family, address_id):
+        try:
+            payload = json.dumps({"op": op, **data}).encode()
+        except (TypeError, ValueError) as exc:
+            raise StoreFailure("invalid_response", False, "encode", 0, type(exc).__name__) from None
+        if len(payload) > MAX_BODY_BYTES:
+            raise StoreFailure("invalid_response", False, "encode", 0, "BodyTooLarge")
+        host = urlsplit(self.url).hostname
+        message = (
+            f"POST /v1/store HTTP/1.1\r\nHost: {host}\r\n"
+            f"Authorization: Bearer {self.secret}\r\nAccept: application/json\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode() + payload
+        # Bytes may leave this process as soon as send starts. A later timeout
+        # is not proof that the store failed to commit, so this attempt ends.
+        started = self._clock()
+        try:
+            tls.settimeout(self.read_budget)
+            tls.sendall(message)
+            raw = self._read_response(tls)
+        except TimeoutError as exc:
+            raise StoreFailure("response_timeout", True, "response", self._elapsed(started),
+                               type(exc).__name__) from None
+        except OSError as exc:
+            raise StoreFailure("response_timeout", True, "response", self._elapsed(started),
+                               type(exc).__name__) from None
+        self._emit(correlation, family=self._family_name(family), phase="response",
+                   ms=self._elapsed(started), address=address_id, result="ok")
+        try:
+            return decode_store_response(raw)
+        except ApiError as exc:
+            # A body arrived after the request was written. An unusable body does
+            # not prove the write failed, so the caller must not send it again.
+            if exc.reason == "invalid_response":
+                exc.submitted = True
+            raise
+
+    def _read_response(self, tls):
+        # Stop at Content-Length. Waiting for the server to close would turn a
+        # finished response into a response timeout and could replay nothing
+        # useful while hiding a body that already arrived.
+        buffer = bytearray()
+        while b"\r\n\r\n" not in buffer:
+            block = tls.recv(16384)
+            if not block:
+                break
+            buffer.extend(block)
+            if len(buffer) > MAX_STORE_RESPONSE_BYTES + 65536:
+                raise StoreFailure("invalid_response", True, "response", 0, "Oversized")
+        if b"\r\n\r\n" not in buffer:
+            # The request was already written. No header means the outcome is
+            # unknown, so a purge must stay uncertain instead of being retried.
+            if not buffer:
+                raise StoreFailure("response_timeout", True, "response", 0, "Closed")
+            raise StoreFailure("invalid_response", True, "response", 0, "Truncated")
+        head, rest = buffer.split(b"\r\n\r\n", 1)
+        body = bytearray(rest)
+        headers = {}
+        for line in head.split(b"\r\n")[1:]:
+            if b":" not in line:
+                continue
+            name, value = line.split(b":", 1)
+            key = bytes(name).strip().lower()
+            if key in headers and key in {b"content-length", b"transfer-encoding"}:
+                raise StoreFailure("invalid_response", True, "response", 0, "DuplicateHeader")
+            headers.setdefault(key, bytes(value).strip().lower())
+        chunked = b"chunked" in headers.get(b"transfer-encoding", b"")
+        if chunked:
+            body = self._read_chunked(tls, body)
+        elif b"content-length" in headers:
+            try:
+                length = int(headers[b"content-length"])
+            except ValueError:
+                raise StoreFailure("invalid_response", True, "response", 0, "ContentLength") from None
+            if length < 0 or length > MAX_STORE_RESPONSE_BYTES:
+                raise StoreFailure("invalid_response", True, "response", 0, "ContentLength")
+            while len(body) < length:
+                block = tls.recv(16384)
+                if not block:
+                    raise StoreFailure("invalid_response", True, "response", 0, "Truncated")
+                body.extend(block)
+            if len(body) < length:
+                raise StoreFailure("invalid_response", True, "response", 0, "Truncated")
+            body = body[:length]
+        else:
+            while len(body) <= MAX_STORE_RESPONSE_BYTES:
+                block = tls.recv(16384)
+                if not block:
+                    break
+                body.extend(block)
+        return bytes(head + b"\r\n\r\n" + body)
+
+    def _read_chunked(self, tls, pending):
+        output = bytearray()
+        pending = bytearray(pending)
+        while True:
+            while b"\r\n" not in pending:
+                block = tls.recv(16384)
+                if not block:
+                    raise StoreFailure("invalid_response", True, "response", 0, "Truncated")
+                pending.extend(block)
+            line, rest = pending.split(b"\r\n", 1)
+            pending = bytearray(rest)
+            try:
+                size = int(line.split(b";", 1)[0].strip() or b"zz", 16)
+            except ValueError:
+                raise StoreFailure("invalid_response", True, "response", 0, "ChunkSize") from None
+            if size == 0:
+                return output
+            if size > MAX_STORE_RESPONSE_BYTES or len(output) + size > MAX_STORE_RESPONSE_BYTES:
+                raise StoreFailure("invalid_response", True, "response", 0, "Oversized")
+            while len(pending) < size + 2:
+                block = tls.recv(16384)
+                if not block:
+                    raise StoreFailure("invalid_response", True, "response", 0, "Truncated")
+                pending.extend(block)
+            output.extend(pending[:size])
+            if pending[size:size + 2] != b"\r\n":
+                raise StoreFailure("invalid_response", True, "response", 0, "ChunkFrame")
+            pending = bytearray(pending[size + 2:])
+
+    def _elapsed(self, started):
+        return int((self._clock() - started) * 1000)
+
+    def _family_name(self, family):
+        if family == socket.AF_INET6:
+            return "ipv6"
+        if family == socket.AF_INET:
+            return "ipv4"
+        return "other"
+
+    def _proxy_env(self):
+        names = ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY",
+                 "https_proxy", "http_proxy", "all_proxy", "no_proxy")
+        present = [name for name in names if os.environ.get(name)]
+        return ",".join(present) if present else "none"
+
+    def _pressure(self):
+        rss = threads = "unavailable"
+        try:
+            status = Path("/proc/self/status").read_text(encoding="utf-8")
+        except OSError:
+            status = ""
+        for line in status.splitlines():
+            if line.startswith("VmRSS:"):
+                rss = line.split()[1]
+            elif line.startswith("Threads:"):
+                threads = line.split()[1]
+        return {"rss_kb": rss, "proc_threads": threads,
+                "python_threads": threading.active_count()}
+
+    def _emit(self, correlation, **fields):
+        order = ("family", "phase", "ms", "addresses", "address", "result", "error",
+                 "proxy_env", "trust_env", "direct", "rss_kb", "proc_threads", "python_threads")
+        parts = [f"store_transport correlation={correlation}"]
+        for key in order:
+            if key in fields and fields[key] is not None:
+                parts.append(f"{key}={fields[key]}")
+        print(" ".join(parts), file=sys.stderr, flush=True)
 
 
 def owner_key(subject):
@@ -250,13 +476,17 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
             raise ApiError("authentication_required", 401)
         return user
 
-    def store_ready():
+    def store_diagnostic():
         try:
             result = store.call("check")
-            return (result.get("status") == "available" and result.get("schema_version") == 1
-                    and result.get("receipt_minted") is False)
-        except ApiError:
-            return False
+        except ApiError as exc:
+            return {"ok": False, "failure": exc.reason or "connect_failure"}
+        schema_version = result.get("schema_version")
+        matched = (result.get("status") == "available" and type(schema_version) is int
+                   and schema_version == 1 and result.get("receipt_minted") is False)
+        if matched:
+            return {"ok": True, "failure": None}
+        return {"ok": False, "failure": "schema_mismatch"}
 
     def csrf_check(form=False):
         if not valid_origin(origin) or request.headers.get("Origin") != origin:
@@ -327,8 +557,12 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
 
     @app.get("/readyz")
     def ready():
-        result = {"auth": auth_ready, "store": store_ready(), "model": bool(engine.ready)}
-        return jsonify(ready=result, receipt_minted=False), 200 if all(result.values()) else 503
+        diagnostic = store_diagnostic()
+        result = {"auth": auth_ready, "store": diagnostic["ok"], "model": bool(engine.ready)}
+        body = {"ready": result, "receipt_minted": False}
+        if diagnostic["failure"]:
+            body["store_failure"] = diagnostic["failure"]
+        return jsonify(body), 200 if all(result.values()) else 503
 
     @app.get("/api/session")
     def session_info():
@@ -336,9 +570,14 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
         if "csrf" not in session:
             session["csrf"] = secrets.token_urlsafe(32)
         user = current_user()
-        return jsonify(user={"name": user["name"]} if user else None,
-                       csrf=session["csrf"], limits=LIMITS,
-                       ready={"auth": auth_ready, "store": store_ready(), "model": bool(engine.ready)})
+        diagnostic = store_diagnostic()
+        body = {"user": {"name": user["name"]} if user else None,
+                "csrf": session["csrf"], "limits": LIMITS,
+                "ready": {"auth": auth_ready, "store": diagnostic["ok"],
+                          "model": bool(engine.ready)}}
+        if diagnostic["failure"]:
+            body["store_failure"] = diagnostic["failure"]
+        return jsonify(body)
 
     @app.post("/auth/login")
     def login():
@@ -392,7 +631,15 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
     def delete_account():
         user = require_user()
         body(set())
-        result = store.call("purge", owner=user["owner"])
+        try:
+            result = store.call("purge", owner=user["owner"])
+        except ApiError as exc:
+            # response_timeout is the route's signal for a lost purge body.
+            # submitted covers every other post-send failure, including a
+            # truncated body. A failure before send can be retried by the user.
+            if exc.submitted or exc.reason == "response_timeout":
+                raise ApiError("erasure_uncertain", 503) from None
+            raise
         if result.get("status") not in {"deleted", "replay"} or not isinstance(result.get("deleted"), dict):
             raise ApiError("store_unavailable", 503)
         session.clear()

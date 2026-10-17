@@ -1,19 +1,16 @@
 import copy
 import io
 import socket
-import sqlite3
+import threading
 import time
 import unittest
 import uuid
 from contextlib import contextmanager
-from pathlib import Path
 from unittest import mock
 
-import requests
-import urllib3
 from urllib3.util import connection as urllib3_connection
 
-from app import ApiError, ISSUER, Store, create_app, owner_key
+from app import ApiError, ISSUER, Store, StoreFailure, create_app, decode_store_response, owner_key
 from engine import Engine, MAX_INPUT_TOKENS
 
 
@@ -158,6 +155,15 @@ class HostedAppTests(unittest.TestCase):
                               store=self.store, engine=self.engine, oauth_client=self.oauth)
         self.client = self.app.test_client()
         self.base = {"base_url": ORIGIN}
+
+    def rebuild(self, store):
+        self.store = store
+        self.app = create_app({"TESTING": True, "PUBLIC_ORIGIN": ORIGIN,
+                               "SESSION_SECRET": "s" * 32, "OAUTH_CLIENT_ID": "synthetic-id",
+                               "OAUTH_CLIENT_SECRET": "synthetic-secret",
+                               "OPENID_PROVIDER_URL": ISSUER},
+                              store=store, engine=self.engine, oauth_client=self.oauth)
+        self.client = self.app.test_client()
 
     def sign_in(self, subject="synthetic-user"):
         with self.client.session_transaction(base_url=ORIGIN) as browser:
@@ -352,6 +358,90 @@ class HostedAppTests(unittest.TestCase):
         self.assertEqual(response.status_code, 503)
         self.assertEqual(self.client.get("/api/conversations", **self.base).status_code, 200)
 
+    def test_readiness_checks_are_not_cached(self):
+        self.assertEqual(self.client.get("/readyz", **self.base).status_code, 200)
+        self.assertEqual(self.client.get("/readyz", **self.base).status_code, 200)
+        self.assertEqual([op for op, _ in self.store.calls].count("check"), 2)
+        self.assertNotIn("store_failure", self.client.get("/api/session", **self.base).json)
+
+    def test_schema_mismatch_stays_unready(self):
+        class SchemaStore(FakeStore):
+            def call(self, op, **data):
+                if op == "check":
+                    self.calls.append((op, copy.deepcopy(data)))
+                    return {"status": "available", "schema_version": 2, "receipt_minted": False}
+                return super().call(op, **data)
+
+        self.rebuild(SchemaStore())
+        response = self.client.get("/readyz", **self.base)
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(response.json["ready"]["store"])
+        self.assertTrue(response.json["ready"]["auth"])
+        self.assertEqual(response.json["store_failure"], "schema_mismatch")
+        self.assertFalse(response.json["receipt_minted"])
+
+    def test_uncertain_purge_preserves_later_data_and_session(self):
+        class LosingPurge(FakeStore):
+            def call(self, op, **data):
+                if op == "purge":
+                    self.calls.append((op, copy.deepcopy(data)))
+                    self.messages.clear()
+                    if sum(item[0] == "purge" for item in self.calls) == 1:
+                        self.messages.append({"role": "user", "content": "intervening conversation"})
+                    raise ApiError("store_unavailable", 503, reason="response_timeout")
+                return super().call(op, **data)
+
+        self.rebuild(LosingPurge())
+        self.sign_in()
+        self.store.messages = [{"role": "user", "content": "Private owner data"}]
+        response = self.client.delete("/api/account", json={},
+                                      headers={"Origin": ORIGIN, "X-CSRF-Token": "synthetic-csrf"},
+                                      **self.base)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json["error"], "erasure_uncertain")
+        self.assertEqual([op for op, _ in self.store.calls].count("purge"), 1)
+        self.assertEqual(self.store.messages, [{"role": "user", "content": "intervening conversation"}])
+        reopened = self.client.get("/api/conversations/" + CONVERSATION_ID, **self.base)
+        self.assertEqual(reopened.status_code, 200)
+        self.assertEqual(reopened.json["messages"], self.store.messages)
+        self.assertEqual(len(self.store.other_messages), 1)
+
+    def test_boolean_schema_version_stays_unready(self):
+        class BoolSchema(FakeStore):
+            def call(self, op, **data):
+                if op == "check":
+                    self.calls.append((op, copy.deepcopy(data)))
+                    return {"status": "available", "schema_version": True, "receipt_minted": False}
+                return super().call(op, **data)
+
+        self.rebuild(BoolSchema())
+        response = self.client.get("/readyz", **self.base)
+        self.assertEqual(response.status_code, 503)
+        self.assertFalse(response.json["ready"]["store"])
+        self.assertEqual(response.json["store_failure"], "schema_mismatch")
+
+    def test_submitted_purge_error_stays_uncertain_without_retry(self):
+        class SubmittedPurge(FakeStore):
+            def call(self, op, **data):
+                if op == "purge":
+                    self.calls.append((op, copy.deepcopy(data)))
+                    self.messages.clear()
+                    self.messages.append({"role": "user", "content": "intervening conversation"})
+                    raise ApiError("store_unavailable", 503, reason="invalid_response", submitted=True)
+                return super().call(op, **data)
+
+        self.rebuild(SubmittedPurge())
+        self.sign_in()
+        self.store.messages = [{"role": "user", "content": "Private owner data"}]
+        response = self.client.delete("/api/account", json={},
+                                      headers={"Origin": ORIGIN, "X-CSRF-Token": "synthetic-csrf"},
+                                      **self.base)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json["error"], "erasure_uncertain")
+        self.assertEqual([op for op, _ in self.store.calls].count("purge"), 1)
+        self.assertEqual(self.store.messages, [{"role": "user", "content": "intervening conversation"}])
+        self.assertEqual(self.client.get("/api/conversations", **self.base).status_code, 200)
+
 
 class EngineAdmissionTests(unittest.TestCase):
     def test_token_limit_preflight_releases_actual_lock(self):
@@ -381,245 +471,317 @@ class EngineAdmissionTests(unittest.TestCase):
         self.assertFalse(engine._lock.locked())
 
 
+class ScriptedSocket:
+    def __init__(self, harness, mode):
+        self.harness = harness
+        self.mode = mode
+        self.timeout = None
+        self.sent = b""
+
+    def settimeout(self, value):
+        self.timeout = value
+
+    def connect(self, address):
+        self.harness.events.append(("connect", address[0]))
+        if self.mode == "connect-timeout":
+            self.harness.advance(self.timeout)
+            raise TimeoutError("synthetic-connect")
+        if self.mode == "refuse":
+            raise ConnectionRefusedError("synthetic-refuse")
+
+    def sendall(self, data):
+        self.sent += data
+        self.harness.sent.append(data)
+        self.harness.events.append(("send",))
+        if self.mode in {"lose-response", "close-early"}:
+            if self.harness.events.count(("send",)) == 1:
+                self.harness.conversations.clear()
+                self.harness.conversations.add("new-conversation")
+            else:
+                self.harness.conversations.clear()
+
+    def recv(self, _size):
+        if self.mode == "close-early":
+            return b""
+        if self.mode == "ok-hold" and not self.harness.payload:
+            raise TimeoutError("synthetic-held-open")
+        if self.mode == "short":
+            if not self.harness.payload:
+                return b""
+            chunk = self.harness.payload
+            self.harness.payload = b""
+            return chunk
+        if self.mode != "ok" and self.mode != "ok-hold":
+            raise TimeoutError("synthetic-read")
+        if not self.harness.payload:
+            return b""
+        chunk = self.harness.payload[:16384]
+        self.harness.payload = self.harness.payload[len(chunk):]
+        return chunk
+
+    def close(self):
+        self.harness.events.append(("close",))
+
+
+class ScriptedContext:
+    def __init__(self, harness):
+        self.harness = harness
+
+    def wrap_socket(self, sock, server_hostname):
+        self.harness.events.append(("tls", server_hostname))
+        if sock.mode == "tls-timeout":
+            self.harness.advance(sock.timeout)
+            raise TimeoutError("synthetic-tls")
+        return ScriptedSocket(self.harness, sock.mode)
+
+
+class TransportHarness:
+    def __init__(self, modes, addresses=2, ipv6_modes=None):
+        self.modes = list(modes)
+        self.ipv6_modes = list(ipv6_modes or [])
+        self.addresses = addresses
+        self.events = []
+        self.sent = []
+        self.now = 0
+        self.conversations = {"existing-conversation"}
+        self.payload = b""
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def getaddrinfo(self, host, port, family, socktype):
+        self.events.append(("dns", family, host, port, socktype))
+        if family == socket.AF_INET6:
+            if not self.ipv6_modes:
+                raise socket.gaierror(socket.EAI_NONAME, "synthetic-ipv6")
+            return [(socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("2001:db8::1", 443, 0, 0))]
+        return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", (f"203.0.113.{index}", 443))
+                for index in range(1, self.addresses + 1)]
+
+    def socket(self, af, socktype, proto):
+        if af == socket.AF_INET6:
+            if not self.ipv6_modes:
+                raise AssertionError("unexpected ipv6 connection")
+            return ScriptedSocket(self, self.ipv6_modes.pop(0))
+        if not self.modes:
+            raise AssertionError("unexpected extra connection")
+        return ScriptedSocket(self, self.modes.pop(0))
+
+    def context(self):
+        return ScriptedContext(self)
+
+    def patch(self):
+        return mock.patch.multiple(
+            "app.socket", getaddrinfo=self.getaddrinfo, socket=self.socket,
+        ), mock.patch("app.ssl.create_default_context", self.context)
+
+    def response(self, body):
+        encoded = body.encode()
+        self.payload = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+            + str(len(encoded)).encode() + b"\r\nConnection: close\r\n\r\n" + encoded
+        )
+
+
 class StoreTransportTests(unittest.TestCase):
-    def _response(self):
-        response = mock.Mock()
-        response.status_code = 200
-        response.headers = {"content-type": "application/json"}
-        response.iter_content = lambda chunk_size: [
-            b'{"status":"available","schema_version":1,"receipt_minted":false}'
-        ]
-        response.__enter__ = lambda self: self
-        response.__exit__ = lambda *args: None
-        return response
+    def _store(self, harness, **budgets):
+        store = Store("https://example.account.workers.dev", "b" * 32, **budgets)
+        store._clock = lambda: harness.now
+        return store
 
-    def test_store_call_uses_ipv6_and_restores_resolver(self):
-        seen = []
-        original = urllib3_connection.allowed_gai_family
-
-        class Capture(requests.Session):
-            def post(self, url, **kwargs):
-                seen.append(urllib3_connection.allowed_gai_family())
-                return StoreTransportTests._response(None)
-
-        store = Store("https://example.account.workers.dev", "a" * 32)
-        with mock.patch("app.requests.Session", Capture):
-            body = store.call("check")
-        self.assertEqual(body["schema_version"], 1)
-        self.assertEqual(seen, [socket.AF_INET6])
-        self.assertIs(urllib3_connection.allowed_gai_family, original)
-
-    def test_store_call_falls_back_to_ipv4_after_transport_failure(self):
-        seen = []
-        original = urllib3_connection.allowed_gai_family
-
-        class Capture(requests.Session):
-            def post(self, url, **kwargs):
-                seen.append(urllib3_connection.allowed_gai_family())
-                if len(seen) == 1:
-                    raise requests.ConnectionError("synthetic")
-                return StoreTransportTests._response(None)
-
-        store = Store("https://example.account.workers.dev", "a" * 32)
-        with mock.patch("app.requests.Session", Capture):
-            body = store.call("check")
-        self.assertEqual(body["schema_version"], 1)
-        self.assertEqual(seen, [socket.AF_INET6, socket.AF_INET])
-        self.assertIs(urllib3_connection.allowed_gai_family, original)
-
-    def test_transport_failure_log_records_versions_and_function_names_only(self):
-        secret = "super-secret-header-value"
-        original = urllib3_connection.allowed_gai_family
-
-        class Capture(requests.Session):
-            def post(self, url, **kwargs):
-                try:
-                    def connect():
-                        raise OSError(secret)
-                    connect()
-                except OSError as inner:
-                    raise requests.ReadTimeout("outer-" + secret) from inner
-
-        store = Store("https://example.account.workers.dev", "a" * 32)
+    def _run(self, harness, store, op="check", **data):
         stderr = io.StringIO()
-        with mock.patch("app.requests.Session", Capture), mock.patch("app.sys.stderr", stderr):
-            with self.assertRaises(ApiError):
-                store.call("purge", owner=OWNER)
-        text = stderr.getvalue()
-        self.assertNotIn(secret, text)
-        self.assertNotIn("Authorization", text)
-        self.assertNotIn("Bearer", text)
-        self.assertIn(f"requests={requests.__version__}", text)
-        self.assertIn(f"urllib3={urllib3.__version__}", text)
-        self.assertIn("error=ReadTimeout", text)
-        self.assertIn("connect", text)
-        self.assertIn("OSError", text)
-        self.assertEqual(text.count("store_transport_failed"), 1)
-        self.assertIs(urllib3_connection.allowed_gai_family, original)
+        patches = harness.patch()
+        with patches[0], patches[1], mock.patch("sys.stderr", stderr):
+            try:
+                body = store.call(op, **data)
+            except ApiError as exc:
+                body = exc
+        return body, stderr.getvalue()
 
-    def test_purge_lost_response_does_not_erase_later_data(self):
-        for error_type in (requests.ConnectionError, requests.ReadTimeout,
-                           requests.exceptions.ChunkedEncodingError):
-            with self.subTest(error=error_type.__name__):
-                records = ["before"]
-                posts = []
-                original = urllib3_connection.allowed_gai_family
+    def test_missing_configuration_does_not_connect(self):
+        with self.assertRaises(ApiError) as caught:
+            Store("http://example.account.workers.dev", "b" * 32).call("check")
+        self.assertEqual(caught.exception.reason, "missing_configuration")
 
-                class Capture(requests.Session):
-                    def post(self, url, **kwargs):
-                        posts.append(urllib3_connection.allowed_gai_family())
-                        records.clear()  # The original purge commits.
-                        response = StoreTransportTests._response(None)
-                        if len(posts) == 1:
-                            records.append("created-after-first-purge")
+    def test_invalid_response_is_distinct_from_transport_failure(self):
+        with self.assertRaises(ApiError) as caught:
+            decode_store_response(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nnope")
+        self.assertEqual(caught.exception.reason, "invalid_response")
 
-                            def lost_response(chunk_size):
-                                yield b'{"status":'
-                                raise error_type("synthetic response lost after commit")
-                            response.iter_content = lost_response
-                        return response
-
-                store = Store("https://example.account.workers.dev", "a" * 32)
-                with mock.patch("app.requests.Session", Capture):
-                    with self.assertRaises(ApiError) as raised:
-                        store.call("purge", owner=OWNER)
-                self.assertEqual((raised.exception.code, raised.exception.status),
-                                 ("store_unavailable", 503))
-                self.assertEqual(posts, [socket.AF_INET6])
-                self.assertEqual(records, ["created-after-first-purge"])
-                self.assertIs(urllib3_connection.allowed_gai_family, original)
-
-    def test_lost_purge_response_keeps_later_same_owner_conversation(self):
-        # Schema file applied to a private memory database. No live Worker or D1.
-        schema = Path(__file__).resolve().parents[1].joinpath("edge", "schema.sql").read_text(encoding="utf-8")
-        for error_type in (requests.ConnectionError, requests.ReadTimeout,
-                           requests.exceptions.ChunkedEncodingError):
-            with self.subTest(error=error_type.__name__):
-                db = sqlite3.connect(":memory:")
-                try:
-                    db.executescript(schema)
-                    db.execute(
-                        "INSERT INTO conversations (owner, id, title, created_at) VALUES (?, ?, ?, ?)",
-                        (OWNER, str(uuid.uuid4()), "Original", "2026-10-16T00:00:00.000Z"))
-                    db.commit()
-                    posts = []
-                    later_id = str(uuid.uuid4())
-                    original = urllib3_connection.allowed_gai_family
-
-                    def apply_purge():
-                        receipt_id = str(uuid.uuid4())
-                        db.execute("BEGIN IMMEDIATE")
-                        try:
-                            db.execute(
-                                """INSERT INTO erasure_receipts
-                                   (id, kind, created_at, source_revision, evidence_class, signing_status)
-                                   SELECT ?, 'account.data_erased', ?, ?, 'DECLARED', 'UNSIGNED'
-                                   WHERE EXISTS (SELECT 1 FROM messages WHERE owner = ?)
-                                     OR EXISTS (SELECT 1 FROM runs WHERE owner = ?)
-                                     OR EXISTS (SELECT 1 FROM receipts WHERE owner = ?)
-                                     OR EXISTS (SELECT 1 FROM conversations WHERE owner = ?)""",
-                                (receipt_id, "2026-10-17T00:00:00.000Z", "c" * 40,
-                                 OWNER, OWNER, OWNER, OWNER))
-                            for table in ("messages", "runs", "receipts", "conversations"):
-                                db.execute(f"DELETE FROM {table} WHERE owner = ?", (OWNER,))
-                            db.execute("COMMIT")
-                        except Exception:
-                            db.execute("ROLLBACK")
-                            raise
-
-                    class Capture(requests.Session):
-                        def post(self, url, **kwargs):
-                            posts.append(urllib3_connection.allowed_gai_family())
-                            payload = kwargs["json"]
-                            if payload.get("op") != "purge" or payload.get("owner") != OWNER:
-                                raise AssertionError("purge targeted unexpected storage")
-                            apply_purge()
-                            if len(posts) == 1:
-                                db.execute(
-                                    "INSERT INTO conversations (owner, id, title, created_at) VALUES (?, ?, ?, ?)",
-                                    (OWNER, later_id, "Synthetic conversation",
-                                     "2026-10-17T00:00:01.000Z"))
-                                db.commit()
-                                response = StoreTransportTests._response(None)
-
-                                def lost_response(chunk_size):
-                                    yield b'{"status":'
-                                    raise error_type("synthetic response lost after commit")
-                                response.iter_content = lost_response
-                                return response
-                            return StoreTransportTests._response(None)
-
-                    store = Store("https://example.account.workers.dev", "a" * 32)
-                    with mock.patch("app.requests.Session", Capture):
-                        with self.assertRaises(ApiError) as raised:
-                            store.call("purge", owner=OWNER)
-                    self.assertEqual(raised.exception.status, 503)
-                    self.assertEqual(posts, [socket.AF_INET6])
-                    self.assertEqual(db.execute("SELECT COUNT(*) FROM erasure_receipts").fetchone()[0], 1)
-                    self.assertEqual(
-                        db.execute("SELECT id, title FROM conversations WHERE owner = ?", (OWNER,)).fetchall(),
-                        [(later_id, "Synthetic conversation")])
-                    self.assertIs(urllib3_connection.allowed_gai_family, original)
-                finally:
-                    db.close()
-
-    def test_transport_retry_policy_defaults_unknown_operations_to_writes(self):
-        from urllib3.exceptions import MaxRetryError, NewConnectionError, ProtocolError
-
-        failures = [
-            (requests.ConnectTimeout("synthetic pre-connect"), True),
-            (requests.ConnectionError(MaxRetryError(None, "/v1/store",
-                NewConnectionError(None, "synthetic ENETUNREACH"))), True),
-            (requests.ConnectionError("synthetic ambiguous"), False),
-            (requests.ReadTimeout("synthetic lost response"), False),
-            (requests.exceptions.ChunkedEncodingError("synthetic truncation"), False),
-            (requests.ConnectionError(MaxRetryError(None, "/v1/store",
-                ProtocolError("synthetic post-dispatch disconnect"))), False),
-        ]
-        for op in ("check", "list", "get", "create", "reserve",
-                   "complete", "uncertain", "purge", "future_write"):
-            for error, preconnect in failures:
-                with self.subTest(op=op, error=type(error).__name__, preconnect=preconnect):
-                    seen = []
-                    original = urllib3_connection.allowed_gai_family
-
-                    class Capture(requests.Session):
-                        def post(self, url, **kwargs):
-                            seen.append(urllib3_connection.allowed_gai_family())
-                            if len(seen) == 1:
-                                raise error
-                            return StoreTransportTests._response(None)
-
-                    store = Store("https://example.account.workers.dev", "a" * 32)
-                    retry = op in {"check", "list", "get"} or preconnect
-                    with mock.patch("app.requests.Session", Capture):
-                        if retry:
-                            self.assertEqual(store.call(op, owner=OWNER)["schema_version"], 1)
-                        else:
-                            with self.assertRaises(ApiError) as raised:
-                                store.call(op, owner=OWNER)
-                            self.assertEqual(raised.exception.status, 503)
-                    self.assertEqual(seen, [socket.AF_INET6, socket.AF_INET] if retry
-                                     else [socket.AF_INET6])
-                    self.assertIs(urllib3_connection.allowed_gai_family, original)
-
-    def test_http_failure_does_not_replay_even_read(self):
+    def test_success_logs_split_phases_without_secrets_or_resolver_mutation(self):
         original = urllib3_connection.allowed_gai_family
-        seen = []
-
-        class Capture(requests.Session):
-            def post(self, url, **kwargs):
-                seen.append(urllib3_connection.allowed_gai_family())
-                response = StoreTransportTests._response(None)
-                response.status_code = 503
-                return response
-
-        store = Store("https://example.account.workers.dev", "a" * 32)
-        with mock.patch("app.requests.Session", Capture):
-            with self.assertRaises(ApiError):
-                store.call("check")
-        self.assertEqual(seen, [socket.AF_INET6])
+        harness = TransportHarness(["ok"])
+        harness.addresses = 1
+        harness.response('{"status":"available","schema_version":1,"receipt_minted":false}')
+        with mock.patch.dict("os.environ", {"HTTPS_PROXY": "http://user:proxy-secret-value@203.0.113.9:8080"}):
+            body, logs = self._run(harness, self._store(harness))
+        self.assertEqual(body["schema_version"], 1)
+        self.assertIn("phase=dns", logs)
+        self.assertIn("phase=tcp", logs)
+        self.assertIn("phase=tls", logs)
+        self.assertIn("phase=response", logs)
+        self.assertIn("proxy_env=HTTPS_PROXY", logs)
+        self.assertIn("trust_env=false", logs)
+        self.assertIn("direct=true", logs)
+        self.assertNotIn("proxy-secret-value", logs)
+        self.assertNotIn("b" * 32, logs)
+        self.assertRegex(logs, r"correlation=[0-9a-f]{8}")
         self.assertIs(urllib3_connection.allowed_gai_family, original)
+        self.assertEqual(harness.events.count(("send",)), 1)
+
+    def test_chunked_response_is_decoded_without_waiting_for_close(self):
+        harness = TransportHarness(["ok-hold"])
+        harness.addresses = 1
+        body = b'{"status":"available","schema_version":1,"receipt_minted":false}'
+        chunk = format(len(body), "x").encode() + b"\r\n" + body + b"\r\n0\r\n\r\n"
+        harness.payload = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n"
+            + chunk
+        )
+        decoded, _logs = self._run(harness, self._store(harness))
+        self.assertEqual(decoded["receipt_minted"], False)
+        self.assertEqual(harness.events.count(("send",)), 1)
+
+    def test_completed_response_does_not_wait_for_the_server_to_close(self):
+        harness = TransportHarness(["ok-hold"])
+        harness.addresses = 1
+        harness.response('{"status":"available","schema_version":1,"receipt_minted":false}')
+        body, _logs = self._run(harness, self._store(harness))
+        self.assertEqual(body["schema_version"], 1)
+        self.assertEqual(harness.events.count(("send",)), 1)
+
+    def test_ipv6_stall_stays_inside_one_second_and_ipv4_still_runs(self):
+        harness = TransportHarness(["ok"], addresses=1, ipv6_modes=["connect-timeout"])
+        harness.response('{"status":"available","schema_version":1,"receipt_minted":false}')
+        body, logs = self._run(harness, self._store(harness, connect_budget=8, address_budget=3))
+        self.assertEqual(body["schema_version"], 1)
+        self.assertEqual(harness.now, 1)
+        self.assertEqual([event for event in harness.events if event[0] == "connect"],
+                         [("connect", "2001:db8::1"), ("connect", "203.0.113.1")])
+        self.assertEqual(harness.events.count(("send",)), 1)
+        self.assertIn("result=connect_failure", logs)
+        self.assertNotIn("b" * 32, logs)
+
+    def test_transport_fallback_uses_the_next_address_before_submission(self):
+        harness = TransportHarness(["tls-timeout", "ok"])
+        harness.response('{"status":"available","schema_version":1,"receipt_minted":false}')
+        body, logs = self._run(harness, self._store(harness))
+        self.assertEqual(body["schema_version"], 1)
+        self.assertEqual([event for event in harness.events if event[0] == "connect"],
+                         [("connect", "203.0.113.1"), ("connect", "203.0.113.2")])
+        self.assertEqual(harness.events.count(("send",)), 1)
+        self.assertIn("result=tls_failure", logs)
+        self.assertNotIn("b" * 32, logs)
+
+    def test_redirect_is_not_followed(self):
+        harness = TransportHarness(["ok"])
+        harness.addresses = 1
+        harness.payload = (
+            b"HTTP/1.1 302 Found\r\nLocation: https://evil.example/v1/store\r\n"
+            b"Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{}"
+        )
+        body, _logs = self._run(harness, self._store(harness), "purge", owner="ab" * 32)
+        self.assertIsInstance(body, ApiError)
+        self.assertEqual(body.reason, "invalid_response")
+        self.assertTrue(body.submitted)
+        self.assertEqual(harness.events.count(("send",)), 1)
+        self.assertEqual([event for event in harness.events if event[0] == "connect"],
+                         [("connect", "203.0.113.1")])
+
+    def test_overall_connect_budget_stops_later_addresses(self):
+        harness = TransportHarness(["connect-timeout", "connect-timeout", "connect-timeout"], addresses=3)
+        store = self._store(harness, connect_budget=5, address_budget=3)
+        body, logs = self._run(harness, store)
+        self.assertIsInstance(body, ApiError)
+        self.assertEqual(body.reason, "connect_failure")
+        self.assertEqual([event[1] for event in harness.events if event[0] == "connect"],
+                         ["203.0.113.1", "203.0.113.2"])
+        self.assertNotIn(("send",), harness.events)
+        self.assertIn("phase=tcp", logs)
+
+    def test_purge_lost_response_does_not_retry_or_delete_new_data(self):
+        harness = TransportHarness(["lose-response"], addresses=2)
+        store = self._store(harness)
+        body, logs = self._run(harness, store, "purge", owner="ab" * 32)
+        self.assertIsInstance(body, ApiError)
+        self.assertEqual(body.reason, "response_timeout")
+        self.assertEqual(harness.events.count(("send",)), 1)
+        self.assertEqual([event for event in harness.events if event[0] == "connect"],
+                         [("connect", "203.0.113.1")])
+        self.assertEqual(harness.conversations, {"new-conversation"})
+        self.assertIn("phase=response", logs)
+        self.assertIn("result=response_timeout", logs)
+        self.assertNotIn("b" * 32, logs)
+
+    def test_purge_closed_before_headers_is_uncertain_and_not_replayed(self):
+        harness = TransportHarness(["close-early"], addresses=2)
+        body, _logs = self._run(harness, self._store(harness), "purge", owner="ab" * 32)
+        self.assertIsInstance(body, ApiError)
+        self.assertEqual(body.reason, "response_timeout")
+        self.assertTrue(body.submitted)
+        self.assertEqual(harness.events.count(("send",)), 1)
+        self.assertEqual(harness.conversations, {"new-conversation"})
+
+    def test_duplicate_content_length_is_rejected(self):
+        harness = TransportHarness(["ok"], addresses=2)
+        harness.payload = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Content-Length: 1\r\nContent-Length: 1\r\n\r\n{}"
+        )
+        result, _logs = self._run(harness, self._store(harness), "purge", owner="ab" * 32)
+        self.assertIsInstance(result, ApiError)
+        self.assertEqual(result.reason, "invalid_response")
+        self.assertTrue(result.submitted)
+        self.assertEqual(harness.events.count(("send",)), 1)
+
+    def test_short_content_length_is_not_accepted(self):
+        harness = TransportHarness(["short"], addresses=2)
+        body = b'{"status":"available","schema_version":1,"receipt_minted":false}'
+        harness.payload = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 200\r\n\r\n"
+            + body
+        )
+        result, _logs = self._run(harness, self._store(harness))
+        self.assertIsInstance(result, ApiError)
+        self.assertEqual(result.reason, "invalid_response")
+        self.assertTrue(result.submitted)
+        self.assertEqual(harness.events.count(("send",)), 1)
+
+    def test_concurrent_readiness_checks_are_not_serialized(self):
+        store = Store("https://example.account.workers.dev", "b" * 32)
+        state = {"current": 0, "peak": 0}
+        lock = threading.Lock()
+
+        def exchange(_op, _data, family, _deadline, _correlation):
+            with lock:
+                state["current"] += 1
+                state["peak"] = max(state["peak"], state["current"])
+            time.sleep(0.05)
+            with lock:
+                state["current"] -= 1
+            if family == socket.AF_INET6:
+                raise StoreFailure("connect_failure", False, "tcp", 1, "ConnectionRefusedError")
+            return {"status": "available", "schema_version": 1, "receipt_minted": False}
+
+        store._exchange = exchange
+        errors = []
+
+        def run():
+            try:
+                body = store.call("check")
+                if body["schema_version"] != 1:
+                    errors.append(body)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(state["peak"], 2)
 
 
 if __name__ == "__main__":
