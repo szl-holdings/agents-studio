@@ -27,6 +27,9 @@ class FakeStore:
         self.runs = []
         self.unavailable = set()
         self.stale = False
+        self.lose_complete_response = False
+        self.fail_get_after = None
+        self._gets = 0
         self.other_messages = [{"owner": owner_key("other"), "content": "Private other data"}]
 
     def call(self, op, **data):
@@ -39,6 +42,9 @@ class FakeStore:
             return {"conversations": [{"owner": data["owner"], "id": CONVERSATION_ID}],
                     "receipt_minted": False}
         if op == "get":
+            self._gets += 1
+            if self.fail_get_after is not None and self._gets > self.fail_get_after:
+                raise ApiError("store_unavailable", 503)
             if data["id"] != CONVERSATION_ID or data["owner"] != OWNER:
                 raise ApiError("not_found", 404)
             return {"conversation": {"owner": OWNER, "id": CONVERSATION_ID},
@@ -61,6 +67,8 @@ class FakeStore:
             run["state"] = "completed"
             run["output"] = data["output"]
             self.messages.append({"role": "assistant", "content": data["output"]})
+            if self.lose_complete_response:
+                raise ApiError("store_unavailable", 503)
             return {"status": "completed", "run": copy.deepcopy(run),
                     "receipt": {"kind": "run.completed"}}
         if op == "uncertain":
@@ -263,6 +271,29 @@ class HostedAppTests(unittest.TestCase):
         self.assertTrue(repeated.json["replay"])
         self.assertEqual(self.engine.generations, 1)
         self.assertEqual([op for op, _ in self.store.calls].count("reserve"), 1)
+
+    def test_lost_complete_response_is_read_back_without_uncertain(self):
+        self.sign_in()
+        self.store.lose_complete_response = True
+        response = self.run_request()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["status"], "completed")
+        self.assertEqual(response.json["run"]["output"], "Synthetic answer")
+        self.assertIsNone(response.json["receipt"])
+        self.assertEqual(self.store.runs[0]["state"], "completed")
+        self.assertEqual(self.engine.generations, 1)
+        self.assertNotIn("uncertain", [op for op, _ in self.store.calls])
+
+    def test_lost_complete_without_readback_does_not_send_uncertain(self):
+        self.sign_in()
+        self.store.lose_complete_response = True
+        self.store.fail_get_after = 1
+        response = self.run_request()
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json["error"], "run_outcome_uncertain")
+        self.assertEqual(self.store.runs[0]["state"], "completed")
+        self.assertEqual(self.engine.generations, 1)
+        self.assertNotIn("uncertain", [op for op, _ in self.store.calls])
 
     def test_mismatched_replay_owner_fails_closed(self):
         self.sign_in()
