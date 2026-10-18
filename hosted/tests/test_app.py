@@ -390,10 +390,63 @@ class HostedAppTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/conversations", **self.base).status_code, 200)
 
     def test_readiness_checks_are_not_cached(self):
+        self.sign_in()
         self.assertEqual(self.client.get("/readyz", **self.base).status_code, 200)
         self.assertEqual(self.client.get("/readyz", **self.base).status_code, 200)
         self.assertEqual([op for op, _ in self.store.calls].count("check"), 2)
         self.assertNotIn("store_failure", self.client.get("/api/session", **self.base).json)
+        self.assertEqual([op for op, _ in self.store.calls].count("check"), 3)
+
+    def test_anonymous_diagnostics_do_not_probe_store(self):
+        self.store.unavailable.add("check")
+        first = self.client.get("/api/session", **self.base)
+        second = self.client.get("/api/session", **self.base)
+        for response in (first, second):
+            self.assertEqual(response.status_code, 200)
+            self.assertIsNone(response.json["user"])
+            self.assertFalse(response.json["ready"]["store"])
+            self.assertEqual(response.json["store_evidence"], "UNKNOWN")
+            self.assertNotIn("store_failure", response.json)
+        self.assertEqual(first.json["csrf"], second.json["csrf"])
+        self.assertEqual(self.store.calls, [])
+        for _ in range(2):
+            ready = self.client.get("/readyz", **self.base)
+            self.assertEqual(ready.status_code, 503)
+            self.assertFalse(ready.json["ready"]["store"])
+            self.assertEqual(ready.json["store_evidence"], "UNKNOWN")
+            self.assertNotIn("store_failure", ready.json)
+            self.assertFalse(ready.json["receipt_minted"])
+        self.assertEqual(self.store.calls, [])
+
+    def test_authenticated_session_checks_store_fresh_and_recovers(self):
+        self.sign_in()
+        first = self.client.get("/api/session", **self.base)
+        self.assertTrue(first.json["ready"]["store"])
+        self.assertNotIn("store_evidence", first.json)
+        self.store.unavailable.add("check")
+        failed = self.client.get("/api/session", **self.base)
+        self.assertFalse(failed.json["ready"]["store"])
+        self.assertIn("store_failure", failed.json)
+        self.store.unavailable.remove("check")
+        recovered = self.client.get("/api/session", **self.base)
+        self.assertTrue(recovered.json["ready"]["store"])
+        self.assertNotIn("store_failure", recovered.json)
+        self.assertEqual([op for op, _ in self.store.calls], ["check"] * 3)
+
+    def test_authenticated_readiness_fails_and_recovers_without_cache(self):
+        self.sign_in()
+        self.assertEqual(self.client.get("/readyz", **self.base).status_code, 200)
+        self.store.unavailable.add("check")
+        failed = self.client.get("/readyz", **self.base)
+        self.assertEqual(failed.status_code, 503)
+        self.assertFalse(failed.json["ready"]["store"])
+        self.assertIn("store_failure", failed.json)
+        self.store.unavailable.remove("check")
+        recovered = self.client.get("/readyz", **self.base)
+        self.assertEqual(recovered.status_code, 200)
+        self.assertTrue(recovered.json["ready"]["store"])
+        self.assertNotIn("store_failure", recovered.json)
+        self.assertEqual([op for op, _ in self.store.calls], ["check"] * 3)
 
     def test_readiness_asks_for_the_comparison_before_the_check(self):
         class ComparingStore(FakeStore):
@@ -410,6 +463,7 @@ class HostedAppTests(unittest.TestCase):
 
         store = ComparingStore()
         self.rebuild(store)
+        self.sign_in()
         self.assertEqual(self.client.get("/readyz", **self.base).status_code, 200)
         self.assertEqual(self.client.get("/api/session", **self.base).status_code, 200)
         self.assertEqual(store.order[:4], ["compare", "check", "compare", "check"])
@@ -421,6 +475,7 @@ class HostedAppTests(unittest.TestCase):
 
         store = ExplodingStore()
         self.rebuild(store)
+        self.sign_in()
         stderr = io.StringIO()
         with mock.patch("sys.stderr", stderr):
             response = self.client.get("/readyz", **self.base)
@@ -440,6 +495,7 @@ class HostedAppTests(unittest.TestCase):
                 return super().call(op, **data)
 
         self.rebuild(SchemaStore())
+        self.sign_in()
         response = self.client.get("/readyz", **self.base)
         self.assertEqual(response.status_code, 503)
         self.assertFalse(response.json["ready"]["store"])
@@ -459,6 +515,7 @@ class HostedAppTests(unittest.TestCase):
                     return super().call(op, **data)
 
             self.rebuild(EpochStore())
+            self.sign_in()
             response = self.client.get("/readyz", **self.base)
             self.assertEqual(response.status_code, 503)
             self.assertEqual(response.json["store_failure"], "schema_mismatch")
@@ -498,6 +555,7 @@ class HostedAppTests(unittest.TestCase):
                 return super().call(op, **data)
 
         self.rebuild(BoolSchema())
+        self.sign_in()
         response = self.client.get("/readyz", **self.base)
         self.assertEqual(response.status_code, 503)
         self.assertFalse(response.json["ready"]["store"])

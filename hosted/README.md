@@ -76,6 +76,14 @@ model outputs. They do not establish successful OAuth, provider deployment,
 durability across restart, or model quality. The original root offline suites
 must also pass before source publication.
 
+`/healthz` is public liveness only. Without a valid signed-in session,
+`/api/session` reports storage `UNKNOWN` without probing D1, and `/readyz`
+returns 503 with the same `UNKNOWN` evidence. That anonymous 503 does not mean
+the store is down. A signed-in `/readyz` performs a fresh schema and admission
+check on every request and returns 200 only when auth configuration, store, and
+model are ready. It is not a public availability monitor or a cost control for
+authenticated request volume.
+
 ## Release
 
 1. Review, sign and push the smallest source change through the ordinary PR path.
