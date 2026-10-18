@@ -67,7 +67,7 @@ timeout is best effort; it is not a hard execution deadline or SLA.
 
 ```powershell
 ..\.venv-hosted\Scripts\python.exe -B -m unittest discover -s tests -p 'test_*.py' -v
-node --test tests/test_store.mjs
+node --test tests/test_store.mjs tests/test_studio_ui.mjs
 node --check static/studio.js
 ```
 

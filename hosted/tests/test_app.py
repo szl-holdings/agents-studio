@@ -496,6 +496,24 @@ class HostedAppTests(unittest.TestCase):
         budget.release()
         budget.release()
 
+    def test_deferred_diagnostic_does_not_bypass_run_store_admission(self):
+        self.sign_in()
+        for _ in range(6):
+            self.assertEqual(self.client.get("/readyz", **self.base).status_code, 200)
+        deferred = self.client.get("/api/session", **self.base)
+        self.assertTrue(deferred.json["store_check_deferred"])
+        self.assertFalse(deferred.json["ready"]["store"])
+        self.store.unavailable.add("get")
+        failed = self.run_request()
+        self.assertEqual(failed.status_code, 503)
+        self.assertEqual(self.engine.generations, 0)
+        self.store.unavailable.remove("get")
+        completed = self.run_request()
+        self.assertEqual(completed.status_code, 200)
+        self.assertEqual(completed.json["status"], "completed")
+        self.assertEqual(self.engine.generations, 1)
+        self.assertEqual([op for op, _ in self.store.calls].count("check"), 6)
+
     def test_readiness_asks_for_the_comparison_before_the_check(self):
         class ComparingStore(FakeStore):
             def __init__(self):
