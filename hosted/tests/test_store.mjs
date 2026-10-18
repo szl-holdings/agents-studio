@@ -5,9 +5,13 @@ import { test } from "node:test";
 import worker from "../edge/store.mjs";
 
 const schema = readFileSync(new URL("../edge/schema.sql", import.meta.url), "utf8");
+const migration = readFileSync(new URL("../edge/migrations/0002_admission_key_epoch.sql", import.meta.url), "utf8");
 const OWNER_A = "a".repeat(64);
 const OWNER_B = "b".repeat(64);
 const SECRET = "synthetic-local-test-secret-not-for-deployment";
+const ADMISSION_SECRET = "synthetic-independent-admission-key-for-tests";
+const ROTATED_SECRET = "synthetic-rotated-store-secret-for-tests";
+const ROTATED_ADMISSION_SECRET = "synthetic-rotated-admission-secret-for-tests";
 
 // The adapter models the D1 binding API and executes every guard against SQLite.
 // It does not claim to test Cloudflare's deployed runtime or network semantics.
@@ -46,6 +50,7 @@ class LocalD1 {
 
   count(table) {
     assert.ok(["conversations", "conversation_admissions", "owner_conversation_admissions",
+      "admission_epoch_schema", "admission_key_epochs",
       "runs", "run_admissions", "owner_run_admissions", "messages",
       "receipts", "erasure_receipts"].includes(table));
     return this.sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n;
@@ -55,7 +60,7 @@ class LocalD1 {
 function environment(t) {
   const DB = new LocalD1();
   t.after(() => DB.sqlite.close());
-  return { DB, STORE_SECRET: SECRET, SOURCE_REVISION: "c".repeat(40) };
+  return { DB, STORE_SECRET: SECRET, ADMISSION_SECRET, SOURCE_REVISION: "c".repeat(40) };
 }
 
 async function call(env, data, options = {}) {
@@ -109,7 +114,8 @@ test("health is a read-only declaration, not database readiness", async (t) => {
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), {
     evidence_class: "DECLARED", source_revision: "c".repeat(40), database_bound: true,
-    authentication_configured: true, storage_readiness: "UNKNOWN", receipt_minted: false,
+    authentication_configured: true, admission_configured: true,
+    storage_readiness: "UNKNOWN", receipt_minted: false,
   });
   assert.equal(env.DB.calls.length, 0);
   assert.equal(env.DB.count("receipts"), 0);
@@ -120,10 +126,11 @@ test("authenticated readiness checks schema without creating state", async (t) =
   const env = environment(t);
   const result = await call(env, { op: "check" });
   assert.equal(result.status, 200);
-  assert.deepEqual(result.data, { status: "available", schema_version: 1, receipt_minted: false });
+  assert.deepEqual(result.data, { status: "available", schema_version: 1,
+    admission_epoch_version: 1, receipt_minted: false });
   assert.ok(env.DB.calls.every(({ sql }) => sql.trim().startsWith("SELECT")));
   assert.equal(env.DB.count("receipts"), 0);
-  env.DB.sqlite.exec("DROP TABLE messages");
+  env.DB.failOn = "SELECT owner, conversation_id, run_id";
   assert.deepEqual((await call(env, { op: "check" })).data, { error: "store_unavailable" });
 });
 
@@ -136,8 +143,114 @@ test("missing, short and incorrect secrets fail closed before SQL", async (t) =>
   for (const secret of [undefined, "short", "x".repeat(32) + " ", "x".repeat(257)]) {
     assert.equal((await call({ ...env, STORE_SECRET: secret }, { op: "check" })).status, 503);
   }
+  for (const admissionSecret of [undefined, "short", SECRET, "x".repeat(32) + " ",
+    "x".repeat(257)]) {
+    assert.equal((await call({ ...env, ADMISSION_SECRET: admissionSecret }, { op: "check" })).status, 503);
+  }
   assert.equal((await call({ ...env, DB: undefined }, { op: "check" })).status, 503);
   assert.equal(env.DB.calls.length, 0);
+});
+
+test("the additive migration retains version-1 schema and admission rows", (t) => {
+  const db = new DatabaseSync(":memory:");
+  t.after(() => db.close());
+  db.exec(`CREATE TABLE studio_schema (id INTEGER PRIMARY KEY CHECK (id = 1),
+      version INTEGER NOT NULL CHECK (version = 1));
+    INSERT INTO studio_schema (id, version) VALUES (1, 1);
+    CREATE TABLE conversation_admissions (day TEXT PRIMARY KEY, admitted INTEGER NOT NULL);
+    INSERT INTO conversation_admissions VALUES ('2026-10-17', 7);
+    CREATE TABLE run_admissions (day TEXT PRIMARY KEY, admitted INTEGER NOT NULL);
+    INSERT INTO run_admissions VALUES ('2026-10-17', 3);`);
+  db.exec(migration);
+  db.exec(migration);
+  assert.equal(db.prepare("SELECT version FROM studio_schema WHERE id = 1").get().version, 1);
+  assert.equal(db.prepare("SELECT admitted FROM conversation_admissions").get().admitted, 7);
+  assert.equal(db.prepare("SELECT admitted FROM run_admissions").get().admitted, 3);
+  assert.equal(db.prepare("SELECT version FROM admission_epoch_schema WHERE id = 1").get().version, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM admission_key_epochs").get().n, 0);
+});
+
+test("legacy current-day admissions hold until the next UTC day", async (t) => {
+  const env = environment(t);
+  env.DB.sqlite.prepare("INSERT INTO conversation_admissions VALUES (date('now'), 1)").run();
+  assert.equal((await call(env, { op: "check" })).status, 503);
+  assert.equal((await call(env, { op: "create", owner: OWNER_A,
+    id: crypto.randomUUID(), title: "Held migration day" })).data.error, "admission_unavailable");
+  assert.equal(env.DB.count("conversations"), 0);
+  env.DB.sqlite.prepare("UPDATE conversation_admissions SET day = '2000-01-01'").run();
+  assert.equal((await call(env, { op: "check" })).status, 200);
+  assert.equal((await call(env, { op: "create", owner: OWNER_A,
+    id: crypto.randomUUID(), title: "New UTC day" })).status, 200);
+});
+
+test("owner-only legacy counter rows also hold admission", async (t) => {
+  const env = environment(t);
+  env.DB.sqlite.prepare("INSERT INTO owner_run_admissions VALUES (date('now'), ?, 1)")
+    .run("f".repeat(64));
+  assert.equal((await call(env, { op: "check" })).status, 503);
+  assert.equal((await call(env, { op: "create", owner: OWNER_A,
+    id: crypto.randomUUID(), title: "Held owner counter" })).data.error, "admission_unavailable");
+  assert.equal(env.DB.count("conversations"), 0);
+});
+
+test("an admission-key outage allows completion and erasure but not new admissions", async (t) => {
+  const env = environment(t);
+  const id = await conversation(env);
+  const run = (await call(env, reservation(id))).data.run;
+  const unavailable = { ...env, ADMISSION_SECRET: undefined };
+  assert.equal((await call(unavailable, { op: "check" })).status, 503);
+  assert.equal((await call(unavailable, reservation(id))).status, 503);
+  assert.equal((await call(unavailable, completion(run))).data.run.state, "completed");
+  assert.equal((await call(unavailable, { op: "purge", owner: OWNER_A })).data.status, "deleted");
+  assert.equal(env.DB.count("conversations"), 0);
+  assert.equal(env.DB.count("admission_key_epochs"), 1);
+});
+
+test("same-day admission-key rotation stays held after account erasure", async (t) => {
+  const env = environment(t);
+  const first = await conversation(env);
+  const second = await conversation(env);
+  const run = (await call(env, reservation(first))).data.run;
+  const epoch = env.DB.sqlite.prepare("SELECT * FROM admission_key_epochs").get();
+  assert.match(epoch.key_fingerprint, /^[a-f0-9]{64}$/);
+  assert.notEqual(epoch.key_fingerprint, ADMISSION_SECRET);
+  const rotated = { ...env, ADMISSION_SECRET: ROTATED_ADMISSION_SECRET };
+  assert.equal((await call(rotated, { op: "check" })).status, 503);
+  assert.equal((await call(rotated, reservation(second))).data.error, "admission_unavailable");
+  assert.equal((await call(rotated, { op: "create", owner: OWNER_B,
+    id: crypto.randomUUID(), title: "Denied rotation" })).data.error, "admission_unavailable");
+  assert.equal((await call(rotated, { op: "uncertain", owner: OWNER_A,
+    run_id: run.id })).data.run.state, "uncertain");
+  assert.equal((await call(rotated, { op: "purge", owner: OWNER_A })).data.status, "deleted");
+  assert.equal((await call(rotated, { op: "create", owner: OWNER_A,
+    id: crypto.randomUUID(), title: "Denied after purge" })).data.error, "admission_unavailable");
+  assert.deepEqual(env.DB.sqlite.prepare("SELECT * FROM admission_key_epochs").get(), epoch);
+  assert.equal(env.DB.count("conversations"), 0);
+  assert.equal((await call(env, { op: "check" })).status, 200);
+});
+
+test("rotating store authentication does not reset owner admission quotas", async (t) => {
+  const env = environment(t);
+  const ids = [];
+  for (let i = 0; i < 19; i++) ids.push(await conversation(env));
+  const ownerTag = env.DB.sqlite.prepare("SELECT owner_tag FROM owner_conversation_admissions").get().owner_tag;
+  const firstRun = (await call(env, reservation(ids[0]))).data.run;
+  await call(env, { op: "uncertain", owner: OWNER_A, run_id: firstRun.id });
+  env.DB.sqlite.prepare("UPDATE owner_run_admissions SET admitted = 19").run();
+  const runTag = env.DB.sqlite.prepare("SELECT owner_tag FROM owner_run_admissions").get().owner_tag;
+  const rotated = { ...env, STORE_SECRET: ROTATED_SECRET };
+  const options = { headers: { authorization: `Bearer ${ROTATED_SECRET}` } };
+  assert.equal((await call(rotated, { op: "create", owner: OWNER_A,
+    id: crypto.randomUUID(), title: "Twentieth" }, options)).status, 200);
+  assert.equal((await call(rotated, { op: "create", owner: OWNER_A,
+    id: crypto.randomUUID(), title: "Over limit" }, options)).status, 429);
+  assert.equal(env.DB.sqlite.prepare("SELECT owner_tag FROM owner_conversation_admissions").get().owner_tag,
+    ownerTag);
+  assert.equal(env.DB.sqlite.prepare("SELECT admitted FROM owner_conversation_admissions").get().admitted, 20);
+  assert.equal((await call(rotated, reservation(ids[1]), options)).status, 200);
+  assert.equal((await call(rotated, reservation(ids[2]), options)).status, 429);
+  assert.equal(env.DB.sqlite.prepare("SELECT owner_tag FROM owner_run_admissions").get().owner_tag, runTag);
+  assert.equal(env.DB.sqlite.prepare("SELECT admitted FROM owner_run_admissions").get().admitted, 20);
 });
 
 test("only fixed paths, methods, fields and JSON operations are accepted", async (t) => {
@@ -234,7 +347,9 @@ test("owner daily conversation creation limit is atomic", async (t) => {
 
 test("global daily conversation admissions survive owner rotation and deletion", async (t) => {
   const env = environment(t);
-  env.DB.sqlite.prepare("INSERT INTO conversation_admissions VALUES (date('now'), 199)").run();
+  await conversation(env, "f".repeat(64));
+  assert.equal((await call(env, { op: "purge", owner: "f".repeat(64) })).status, 200);
+  env.DB.sqlite.prepare("UPDATE conversation_admissions SET admitted = 199 WHERE day = date('now')").run();
   const requests = Array.from({ length: 8 }, (_, i) => ({ op: "create",
     owner: (i + 1).toString(16).padStart(64, "0"), id: crypto.randomUUID(), title: "Bounded global" }));
   const results = await Promise.all(requests.map((request) => call(env, request)));
@@ -449,9 +564,9 @@ test("global daily quota is atomic across different owners", async (t) => {
   const fixtureOwner = "e".repeat(64);
   const fixture = seedConversation(env, fixtureOwner);
   for (let i = 0; i < 199; i++) seedCompleted(env, fixtureOwner, fixture);
-  env.DB.sqlite.prepare("INSERT INTO run_admissions VALUES (date('now'), 199)").run();
   const idA = await conversation(env);
   const idB = await conversation(env, OWNER_B);
+  env.DB.sqlite.prepare("INSERT INTO run_admissions VALUES (date('now'), 199)").run();
   const requests = [reservation(idA), reservation(idB, { owner: OWNER_B })];
   const results = await Promise.all(requests.map((request) => call(env, request)));
   assert.equal(results.filter((result) => result.data.status === "pending").length, 1);

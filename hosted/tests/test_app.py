@@ -40,7 +40,8 @@ class FakeStore:
         if op in self.unavailable:
             raise ApiError("store_unavailable", 503)
         if op == "check":
-            return {"status": "available", "schema_version": 1, "receipt_minted": False}
+            return {"status": "available", "schema_version": 1,
+                    "admission_epoch_version": 1, "receipt_minted": False}
         if op == "list":
             return {"conversations": [{"owner": data["owner"], "id": CONVERSATION_ID}],
                     "receipt_minted": False}
@@ -418,6 +419,22 @@ class HostedAppTests(unittest.TestCase):
         self.assertTrue(response.json["ready"]["auth"])
         self.assertEqual(response.json["store_failure"], "schema_mismatch")
         self.assertFalse(response.json["receipt_minted"])
+
+    def test_missing_or_boolean_admission_epoch_stays_unready(self):
+        for epoch in (None, True):
+            class EpochStore(FakeStore):
+                def call(self, op, **data):
+                    if op == "check":
+                        self.calls.append((op, copy.deepcopy(data)))
+                        return {"status": "available", "schema_version": 1,
+                                "admission_epoch_version": epoch,
+                                "receipt_minted": False}
+                    return super().call(op, **data)
+
+            self.rebuild(EpochStore())
+            response = self.client.get("/readyz", **self.base)
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.json["store_failure"], "schema_mismatch")
 
     def test_uncertain_purge_preserves_later_data_and_session(self):
         class LosingPurge(FakeStore):
