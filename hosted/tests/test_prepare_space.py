@@ -12,3 +12,8 @@ class ExportContractTests(unittest.TestCase):
         self.assertEqual(FILES["static/privacy.html"], "hosted/static/privacy.html")
         for target, source in FILES.items():
             self.assertTrue((static.parent.parent / source).is_file(), target)
+
+    def test_privacy_contact_uses_approved_mailbox(self):
+        privacy = Path(__file__).resolve().parents[1] / "static" / "privacy.html"
+        content = privacy.read_text(encoding="utf-8")
+        self.assertIn('href="mailto:stephen@szlholdings.com"', content)
