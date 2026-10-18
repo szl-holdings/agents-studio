@@ -11,7 +11,7 @@ from unittest import mock
 
 from urllib3.util import connection as urllib3_connection
 
-from app import (ApiError, HANDSHAKE_WINDOW_BYTES, ISSUER, RESPONSE_WINDOW_BYTES, Store,
+from app import (ApiError, DiagnosticBudget, HANDSHAKE_WINDOW_BYTES, ISSUER, RESPONSE_WINDOW_BYTES, Store,
                  StoreFailure, TCP_SEGMENT_CEILING, create_app, decode_store_response,
                  owner_key, valid_store_url)
 from engine import Engine, MAX_INPUT_TOKENS
@@ -447,6 +447,72 @@ class HostedAppTests(unittest.TestCase):
         self.assertTrue(recovered.json["ready"]["store"])
         self.assertNotIn("store_failure", recovered.json)
         self.assertEqual([op for op, _ in self.store.calls], ["check"] * 3)
+
+    def test_authenticated_diagnostics_are_bounded_and_recover_fresh(self):
+        self.sign_in()
+        clock = [100.0]
+        self.app.extensions["studio_diagnostic_budget"]._clock = lambda: clock[0]
+        for index in range(6):
+            response = self.client.get("/readyz" if index % 2 else "/api/session", **self.base)
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.json["ready"]["store"])
+        for path, expected_status in (("/api/session", 200), ("/readyz", 503)):
+            response = self.client.get(path, **self.base)
+            self.assertEqual(response.status_code, expected_status)
+            self.assertFalse(response.json["ready"]["store"])
+            self.assertEqual(response.json["store_evidence"], "UNKNOWN")
+            self.assertTrue(response.json["store_check_deferred"])
+            self.assertNotIn("store_failure", response.json)
+        self.assertEqual([op for op, _ in self.store.calls], ["check"] * 6)
+        clock[0] += 60
+        self.store.unavailable.add("check")
+        failed = self.client.get("/readyz", **self.base)
+        self.assertEqual(failed.status_code, 503)
+        self.assertEqual(failed.json["store_failure"], "connect_failure")
+        self.store.unavailable.remove("check")
+        recovered = self.client.get("/readyz", **self.base)
+        self.assertEqual(recovered.status_code, 200)
+        self.assertTrue(recovered.json["ready"]["store"])
+        self.assertEqual([op for op, _ in self.store.calls], ["check"] * 8)
+
+    def test_global_diagnostic_budget_bounds_many_accounts_without_get_writes(self):
+        for index in range(30):
+            self.sign_in(f"synthetic-user-{index}")
+            self.assertEqual(self.client.get("/readyz", **self.base).status_code, 200)
+        self.sign_in("synthetic-user-30")
+        blocked = self.client.get("/readyz", **self.base)
+        self.assertEqual(blocked.status_code, 503)
+        self.assertEqual(blocked.json["store_evidence"], "UNKNOWN")
+        self.assertTrue(blocked.json["store_check_deferred"])
+        self.assertEqual([op for op, _ in self.store.calls], ["check"] * 30)
+
+    def test_diagnostic_budget_limits_inflight_probes(self):
+        budget = DiagnosticBudget(clock=lambda: 100.0)
+        self.assertTrue(budget.acquire("one"))
+        self.assertTrue(budget.acquire("two"))
+        self.assertFalse(budget.acquire("three"))
+        budget.release()
+        self.assertTrue(budget.acquire("three"))
+        budget.release()
+        budget.release()
+
+    def test_deferred_diagnostic_does_not_bypass_run_store_admission(self):
+        self.sign_in()
+        for _ in range(6):
+            self.assertEqual(self.client.get("/readyz", **self.base).status_code, 200)
+        deferred = self.client.get("/api/session", **self.base)
+        self.assertTrue(deferred.json["store_check_deferred"])
+        self.assertFalse(deferred.json["ready"]["store"])
+        self.store.unavailable.add("get")
+        failed = self.run_request()
+        self.assertEqual(failed.status_code, 503)
+        self.assertEqual(self.engine.generations, 0)
+        self.store.unavailable.remove("get")
+        completed = self.run_request()
+        self.assertEqual(completed.status_code, 200)
+        self.assertEqual(completed.json["status"], "completed")
+        self.assertEqual(self.engine.generations, 1)
+        self.assertEqual([op for op, _ in self.store.calls].count("check"), 6)
 
     def test_readiness_asks_for_the_comparison_before_the_check(self):
         class ComparingStore(FakeStore):

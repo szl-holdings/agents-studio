@@ -67,7 +67,7 @@ timeout is best effort; it is not a hard execution deadline or SLA.
 
 ```powershell
 ..\.venv-hosted\Scripts\python.exe -B -m unittest discover -s tests -p 'test_*.py' -v
-node --test tests/test_store.mjs
+node --test tests/test_store.mjs tests/test_studio_ui.mjs
 node --check static/studio.js
 ```
 
@@ -79,10 +79,14 @@ must also pass before source publication.
 `/healthz` is public liveness only. Without a valid signed-in session,
 `/api/session` reports storage `UNKNOWN` without probing D1, and `/readyz`
 returns 503 with the same `UNKNOWN` evidence. That anonymous 503 does not mean
-the store is down. A signed-in `/readyz` performs a fresh schema and admission
-check on every request and returns 200 only when auth configuration, store, and
-model are ready. It is not a public availability monitor or a cost control for
-authenticated request volume.
+the store is down. Signed-in `/api/session` and `/readyz` share a per-process
+diagnostic budget (six checks per account and 30 total per minute, with at most
+two in flight). An admitted `/readyz` performs a fresh schema and admission
+check; only that fresh check can return 200. When the budget is exhausted,
+storage is reported as `UNKNOWN`, no store call is made, and `/readyz` returns
+503. This is a load guard, not a provider-enforced spending cap: multiple
+replicas have separate budgets, and other authenticated store operations are
+not covered.
 
 ## Release
 

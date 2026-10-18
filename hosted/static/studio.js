@@ -14,10 +14,16 @@ function reportLoad(error) {
 }
 function controls() {
   const signedIn = Boolean(session?.user);
-  const ready = signedIn && session?.ready?.auth && session?.ready?.store && session?.ready?.model;
-  $("new").disabled = !signedIn || !session?.ready?.store || busy;
-  $("prompt").disabled = !ready || busy;
-  $("send").disabled = !ready || !$("prompt").value.trim() || busy;
+  const storeChecked = Boolean(session?.ready?.store);
+  const storeDeferred = Boolean(session?.store_check_deferred);
+  const storageDown = Boolean(session?.store_failure);
+  const canUseStore = signedIn && session?.ready?.auth && !storageDown
+    && (storeChecked || storeDeferred);
+  const canRun = canUseStore && session?.ready?.model;
+  const verifiedReady = canRun && storeChecked;
+  $("new").disabled = !canUseStore || busy;
+  $("prompt").disabled = !canRun || busy;
+  $("send").disabled = !canRun || !$("prompt").value.trim() || busy;
   $("login").disabled = !session?.ready?.auth || busy;
   $("login").hidden = signedIn;
   $("register").hidden = signedIn;
@@ -26,10 +32,10 @@ function controls() {
   $("delete-account").disabled = busy;
   $("export").disabled = !snapshot || busy;
   $("identity").textContent = session?.user?.name || "Not signed in";
-  const storageDown = Boolean(session?.store_failure);
-  $("status").textContent = busy ? "Running" : ready ? "Available"
-    : storageDown ? "Storage unavailable" : signedIn ? "Unavailable" : "Sign in";
-  $("status").classList.toggle("error", (signedIn && !ready) || storageDown);
+  $("status").textContent = busy ? "Running" : verifiedReady ? "Available"
+    : storageDown ? "Storage unavailable" : storeDeferred
+      ? "Check deferred" : signedIn ? "Unavailable" : "Sign in";
+  $("status").classList.toggle("error", (signedIn && !verifiedReady && !storeDeferred) || storageDown);
 }
 function storageMessage(failure) {
   const messages = {
@@ -120,7 +126,8 @@ async function openConversation(id) {
 async function reload() {
   session = await api("/api/session");
   controls();
-  notice(session.store_failure ? storageMessage(session.store_failure) : "");
+  notice(session.store_failure ? storageMessage(session.store_failure)
+    : session.store_check_deferred ? "Availability check deferred. Requests are verified when sent." : "");
   if (session.user) {
     const data = await api("/api/conversations");
     conversations = data.conversations;
