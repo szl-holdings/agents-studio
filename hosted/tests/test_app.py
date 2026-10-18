@@ -13,7 +13,7 @@ from urllib3.util import connection as urllib3_connection
 
 from app import (ApiError, HANDSHAKE_WINDOW_BYTES, ISSUER, RESPONSE_WINDOW_BYTES, Store,
                  StoreFailure, TCP_SEGMENT_CEILING, create_app, decode_store_response,
-                 owner_key)
+                 owner_key, valid_store_url)
 from engine import Engine, MAX_INPUT_TOKENS
 
 
@@ -666,6 +666,35 @@ class TransportHarness:
 
 
 class StoreTransportTests(unittest.TestCase):
+    def test_store_url_allows_dedicated_custom_domain_and_workers_dev(self):
+        for url in ("https://agents-store.a-11-oy.com",
+                    "https://example.account.workers.dev"):
+            with self.subTest(url=url):
+                self.assertTrue(valid_store_url(url))
+                self.assertTrue(Store(url, "b" * 32).configured)
+
+    def test_store_url_rejects_other_domains_and_url_decorations(self):
+        for url in (
+            "http://agents-store.a-11-oy.com",
+            "https://agents-store.a-11-oy.com/",
+            "https://agents-store.a-11-oy.com/v1/store",
+            "https://agents-store.a-11-oy.com?op=check",
+            "https://agents-store.a-11-oy.com#fragment",
+            "https://agents-store.a-11-oy.com:443",
+            "https://user:pass@agents-store.a-11-oy.com",
+            "https://agents-store.a-11-oy.com.evil.example",
+            "https://evil-agents-store.a-11-oy.com",
+            "https://agents-store.a-11-oy.net",
+            "https://agents-store.a-11-oy.com.",
+            "https://AGENTS-STORE.a-11-oy.com",
+            "https://agents-store.a-11-oy.com\n",
+            "https://agents-store.a-11-oy.com\t",
+            "https://example.account.workers.dev/path",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(valid_store_url(url))
+                self.assertFalse(Store(url, "b" * 32).configured)
+
     def _store(self, harness, **budgets):
         store = Store("https://example.account.workers.dev", "b" * 32, **budgets)
         store._clock = lambda: harness.now

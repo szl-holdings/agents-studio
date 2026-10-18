@@ -31,6 +31,7 @@ CONNECT_BUDGET_SECONDS = 8
 ADDRESS_BUDGET_SECONDS = 3
 IPV6_BUDGET_SECONDS = 1
 READ_BUDGET_SECONDS = 15
+DEDICATED_STORE_ORIGIN = "https://agents-store.a-11-oy.com"
 # The Space completes TCP in a few milliseconds and then times out in TLS.
 # MSS 1200 is accepted by the platform and still times out. The receive-window
 # clamp is not available there. Announce a 536-byte MSS, the IPv4 minimum,
@@ -94,6 +95,8 @@ def valid_origin(value):
 
 
 def valid_store_url(value):
+    if value == DEDICATED_STORE_ORIGIN:
+        return True
     if not valid_origin(value):
         return False
     host = urlsplit(value).hostname
