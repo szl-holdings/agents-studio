@@ -824,9 +824,12 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
 
     @app.get("/readyz")
     def ready():
-        diagnostic = store_diagnostic()
+        user = current_user()
+        diagnostic = store_diagnostic() if user else {"ok": False, "failure": None}
         result = {"auth": auth_ready, "store": diagnostic["ok"], "model": bool(engine.ready)}
         body = {"ready": result, "receipt_minted": False}
+        if not user:
+            body["store_evidence"] = "UNKNOWN"
         if diagnostic["failure"]:
             body["store_failure"] = diagnostic["failure"]
         return jsonify(body), 200 if all(result.values()) else 503
@@ -837,11 +840,13 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
         if "csrf" not in session:
             session["csrf"] = secrets.token_urlsafe(32)
         user = current_user()
-        diagnostic = store_diagnostic()
+        diagnostic = store_diagnostic() if user else {"ok": False, "failure": None}
         body = {"user": {"name": user["name"]} if user else None,
                 "csrf": session["csrf"], "limits": LIMITS,
                 "ready": {"auth": auth_ready, "store": diagnostic["ok"],
                           "model": bool(engine.ready)}}
+        if not user:
+            body["store_evidence"] = "UNKNOWN"
         if diagnostic["failure"]:
             body["store_failure"] = diagnostic["failure"]
         return jsonify(body)
