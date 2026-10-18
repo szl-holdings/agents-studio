@@ -28,9 +28,12 @@ repository, billing, inference, or organization scopes.
 
 Set `PUBLIC_ORIGIN` to the exact approved HTTPS origin; do not derive redirects
 from forwarded Host headers. `SESSION_SECRET` must be independently generated
-and kept in Space secrets. `STORE_URL` is the exact HTTPS workers.dev origin of
-the dedicated storage Worker, and `STORE_SECRET` is its independently generated
-server credential. Never use an existing local Studio or operator credential.
+and kept in Space secrets. `STORE_URL` accepts the HTTPS workers.dev origin of
+the dedicated storage Worker or the exact approved Worker Custom Domain origin
+`https://agents-store.a-11-oy.com`. It must have no path, query, fragment, port,
+or credentials. This source allowance does not configure DNS or prove the
+Custom Domain is deployed. `STORE_SECRET` is its independently generated server
+credential. Never use an existing local Studio or operator credential.
 
 Worker bindings: `DB` to the dedicated D1 database, secret `STORE_SECRET`, an
 independently generated `ADMISSION_SECRET`, and `SOURCE_REVISION` to the admitted
