@@ -745,8 +745,10 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
         except ApiError as exc:
             return {"ok": False, "failure": exc.reason or "connect_failure"}
         schema_version = result.get("schema_version")
+        admission_epoch_version = result.get("admission_epoch_version")
         matched = (result.get("status") == "available" and type(schema_version) is int
-                   and schema_version == 1 and result.get("receipt_minted") is False)
+                   and schema_version == 1 and type(admission_epoch_version) is int
+                   and admission_epoch_version == 1 and result.get("receipt_minted") is False)
         if matched:
             return {"ok": True, "failure": None}
         return {"ok": False, "failure": "schema_mismatch"}

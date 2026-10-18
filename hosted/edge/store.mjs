@@ -53,9 +53,49 @@ function revision(env) {
   return /^[a-f0-9]{40}$/.test(env.SOURCE_REVISION || "") ? env.SOURCE_REVISION : "UNKNOWN";
 }
 
+function validSecret(value) {
+  return typeof value === "string" && /^[\x21-\x7e]{32,256}$/.test(value);
+}
+
 function configuredSecret(env) {
-  return typeof env.STORE_SECRET === "string" &&
-    /^[\x21-\x7e]{32,256}$/.test(env.STORE_SECRET);
+  return validSecret(env.STORE_SECRET);
+}
+
+function configuredAdmissionSecret(env) {
+  return validSecret(env.ADMISSION_SECRET) && env.ADMISSION_SECRET !== env.STORE_SECRET;
+}
+
+const EPOCH_GUARD = `(
+  EXISTS (SELECT 1 FROM studio_schema WHERE id = 1 AND version = 1)
+  AND EXISTS (SELECT 1 FROM admission_epoch_schema WHERE id = 1 AND version = 1)
+  AND (EXISTS (SELECT 1 FROM admission_key_epochs WHERE day = ? AND key_fingerprint = ?)
+    OR (NOT EXISTS (SELECT 1 FROM admission_key_epochs WHERE day = ?)
+      AND NOT EXISTS (SELECT 1 FROM conversation_admissions WHERE day = ?)
+      AND NOT EXISTS (SELECT 1 FROM run_admissions WHERE day = ?)
+      AND NOT EXISTS (SELECT 1 FROM owner_conversation_admissions WHERE day = ?)
+      AND NOT EXISTS (SELECT 1 FROM owner_run_admissions WHERE day = ?)))
+)`;
+
+function epochParams(day, fingerprint) {
+  return [day, fingerprint, day, day, day, day, day];
+}
+
+function epochState(db, day) {
+  return prepared(db, `SELECT
+    (SELECT version FROM studio_schema WHERE id = 1) AS schema_version,
+    (SELECT version FROM admission_epoch_schema WHERE id = 1) AS admission_version,
+    (SELECT key_fingerprint FROM admission_key_epochs WHERE day = ?) AS fingerprint,
+    COALESCE((SELECT admitted FROM conversation_admissions WHERE day = ?), 0) AS conversations,
+    COALESCE((SELECT admitted FROM run_admissions WHERE day = ?), 0) AS runs,
+    (SELECT COUNT(*) FROM owner_conversation_admissions WHERE day = ?) AS owner_conversations,
+    (SELECT COUNT(*) FROM owner_run_admissions WHERE day = ?) AS owner_runs`,
+  [day, day, day, day, day]);
+}
+
+function epochUnavailable(state, fingerprint) {
+  return state.schema_version !== 1 || state.admission_version !== 1 || (state.fingerprint !== fingerprint &&
+    (state.fingerprint !== null || state.conversations > 0 || state.runs > 0 ||
+      state.owner_conversations > 0 || state.owner_runs > 0));
 }
 
 async function authorized(request, secret) {
@@ -142,6 +182,13 @@ async function ownerAdmissionTag(secret, kind, day, owner) {
   return [...new Uint8Array(tag)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+async function admissionKeyFingerprint(secret) {
+  const key = await crypto.subtle.importKey("raw", encoder.encode(secret),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const tag = await crypto.subtle.sign("HMAC", key, encoder.encode("szl-studio-admission-key-epoch-v1"));
+  return [...new Uint8Array(tag)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 function cleanupExpiredAdmissions(db, day, receiptId, erasure = false) {
   const marker = erasure ? "erasure_receipts" : "receipts";
   return ["owner_conversation_admissions", "owner_run_admissions"].map((table) =>
@@ -149,7 +196,9 @@ function cleanupExpiredAdmissions(db, day, receiptId, erasure = false) {
       AND EXISTS (SELECT 1 FROM ${marker} WHERE id = ?)`, [day, receiptId]));
 }
 
-async function check(db) {
+async function check(db, admissionSecret) {
+  const day = new Date().toISOString().slice(0, 10);
+  const fingerprint = await admissionKeyFingerprint(admissionSecret);
   const rows = await batch(db, [
     prepared(db, "SELECT version FROM studio_schema WHERE id = 1"),
     prepared(db, "SELECT owner, id, title, created_at FROM conversations LIMIT 0"),
@@ -165,18 +214,24 @@ async function check(db) {
       evidence_class, signing_status FROM receipts LIMIT 0`),
     prepared(db, `SELECT id, kind, created_at, source_revision,
       evidence_class, signing_status FROM erasure_receipts LIMIT 0`),
+    prepared(db, "SELECT id, version FROM admission_epoch_schema LIMIT 0"),
+    prepared(db, "SELECT day, key_fingerprint FROM admission_key_epochs LIMIT 0"),
+    epochState(db, day),
   ]);
-  if (rows[0].results[0]?.version !== 1) throw new StoreError("schema_unavailable", 503);
-  return { status: "available", schema_version: 1, receipt_minted: false };
+  if (rows[0].results[0]?.version !== 1 || epochUnavailable(rows[12].results[0], fingerprint)) {
+    throw new StoreError("schema_unavailable", 503);
+  }
+  return { status: "available", schema_version: 1, admission_epoch_version: 1, receipt_minted: false };
 }
 
-async function create(db, data, source, secret) {
+async function create(db, data, source, admissionSecret) {
   fields(data, ["op", "owner", "id", "title"]);
   string(data.id, 36, UUID);
   string(data.title, 120);
   const now = new Date().toISOString();
   const day = now.slice(0, 10);
-  const ownerTag = await ownerAdmissionTag(secret, "conversation", day, data.owner);
+  const fingerprint = await admissionKeyFingerprint(admissionSecret);
+  const ownerTag = await ownerAdmissionTag(admissionSecret, "conversation", day, data.owner);
   const receiptId = crypto.randomUUID();
   const results = await batch(db, [
     prepared(db, `INSERT INTO conversations (owner, id, title, created_at)
@@ -186,8 +241,10 @@ async function create(db, data, source, secret) {
         WHERE day = ? AND owner_tag = ?), 0) < 20
       AND COALESCE((SELECT admitted FROM conversation_admissions
         WHERE day = ?), 0) < 200
-      AND NOT EXISTS (SELECT 1 FROM conversations WHERE owner = ? AND id = ?)`,
-    [data.owner, data.id, data.title, now, data.owner, day, ownerTag, day, data.owner, data.id]),
+      AND NOT EXISTS (SELECT 1 FROM conversations WHERE owner = ? AND id = ?)
+      AND ${EPOCH_GUARD}`,
+    [data.owner, data.id, data.title, now, data.owner, day, ownerTag, day, data.owner, data.id,
+      ...epochParams(day, fingerprint)]),
     prepared(db, `INSERT INTO conversation_admissions (day, admitted)
       SELECT ?, 1 WHERE changes() = 1
       ON CONFLICT(day) DO UPDATE SET admitted = admitted + 1`, [day]),
@@ -195,17 +252,25 @@ async function create(db, data, source, secret) {
       SELECT ?, ?, 1 WHERE changes() = 1
       ON CONFLICT(day, owner_tag) DO UPDATE SET admitted = admitted + 1`, [day, ownerTag]),
     receipt(db, receiptId, data.owner, "conversation.created", data.id, now, source),
+    prepared(db, `INSERT INTO admission_key_epochs (day, key_fingerprint)
+      SELECT ?, ? WHERE changes() = 1 ON CONFLICT(day) DO NOTHING`, [day, fingerprint]),
     prepared(db, "SELECT * FROM conversations WHERE owner = ? AND id = ?", [data.owner, data.id]),
     readReceipt(db, data.owner, receiptId),
+    epochState(db, day),
     ...cleanupExpiredAdmissions(db, day, receiptId),
   ]);
-  const conversation = results[4].results[0];
-  if (!conversation) throw new StoreError("conversation_limit", 429);
+  const conversation = results[5].results[0];
+  if (!conversation) {
+    if (epochUnavailable(results[7].results[0], fingerprint)) {
+      throw new StoreError("admission_unavailable", 503);
+    }
+    throw new StoreError("conversation_limit", 429);
+  }
   if (!results[0].meta.changes) {
     if (conversation.title !== data.title) throw new StoreError("conversation_conflict", 409);
     return { status: "replay", conversation, receipt: null };
   }
-  return { status: "created", conversation, receipt: results[5].results[0] };
+  return { status: "created", conversation, receipt: results[6].results[0] };
 }
 
 async function list(db, data) {
@@ -230,7 +295,7 @@ async function get(db, data) {
     runs: results[2].results.reverse(), receipt_minted: false };
 }
 
-async function reserve(db, data, source, secret) {
+async function reserve(db, data, source, admissionSecret) {
   fields(data, ["op", "owner", "conversation_id", "idempotency_key", "prompt", "max_output_tokens",
     "expected_message_count"]);
   string(data.conversation_id, 36, UUID);
@@ -246,7 +311,8 @@ async function reserve(db, data, source, secret) {
   const receiptId = crypto.randomUUID();
   const now = new Date().toISOString();
   const day = now.slice(0, 10);
-  const ownerTag = await ownerAdmissionTag(secret, "run", day, data.owner);
+  const fingerprint = await admissionKeyFingerprint(admissionSecret);
+  const ownerTag = await ownerAdmissionTag(admissionSecret, "run", day, data.owner);
   // D1 batch is transactional. The INSERT guards and unique partial index decide
   // reservation ownership together; separate read-then-write quota checks are unsafe.
   const results = await batch(db, [
@@ -261,12 +327,13 @@ async function reserve(db, data, source, secret) {
       AND (SELECT COUNT(*) FROM runs WHERE owner = ? AND conversation_id = ?) < 100
       AND COALESCE((SELECT admitted FROM owner_run_admissions
         WHERE day = ? AND owner_tag = ?), 0) < 20
-      AND COALESCE((SELECT admitted FROM run_admissions WHERE day = ?), 0) < 200`,
+      AND COALESCE((SELECT admitted FROM run_admissions WHERE day = ?), 0) < 200
+      AND ${EPOCH_GUARD}`,
     [runId, data.owner, data.conversation_id, data.idempotency_key, digest, data.prompt,
       data.max_output_tokens, day, now, data.owner, data.conversation_id, data.owner,
       data.idempotency_key, data.owner, data.conversation_id, data.owner,
       data.conversation_id, data.expected_message_count, data.owner, data.conversation_id,
-      day, ownerTag, day]),
+      day, ownerTag, day, ...epochParams(day, fingerprint)]),
     prepared(db, `INSERT INTO run_admissions (day, admitted)
       SELECT ?, 1 WHERE changes() = 1
       ON CONFLICT(day) DO UPDATE SET admitted = admitted + 1`, [day]),
@@ -274,6 +341,8 @@ async function reserve(db, data, source, secret) {
       SELECT ?, ?, 1 WHERE changes() = 1
       ON CONFLICT(day, owner_tag) DO UPDATE SET admitted = admitted + 1`, [day, ownerTag]),
     receipt(db, receiptId, data.owner, "run.reserved", runId, now, source),
+    prepared(db, `INSERT INTO admission_key_epochs (day, key_fingerprint)
+      SELECT ?, ? WHERE changes() = 1 ON CONFLICT(day) DO NOTHING`, [day, fingerprint]),
     prepared(db, `INSERT INTO messages (owner, conversation_id, run_id, role, content, created_at)
       SELECT owner, conversation_id, id, 'user', prompt, created_at FROM runs
       WHERE owner = ? AND id = ?`, [data.owner, runId]),
@@ -292,15 +361,19 @@ async function reserve(db, data, source, secret) {
     [data.owner, data.conversation_id, data.owner, data.conversation_id,
       data.owner, data.conversation_id, data.owner, data.conversation_id,
       day, ownerTag, day]),
+    epochState(db, day),
     ...cleanupExpiredAdmissions(db, day, receiptId),
   ]);
-  const run = results[5].results[0];
+  const run = results[6].results[0];
   if (run) {
     if (run.input_digest !== digest) throw new StoreError("idempotency_conflict", 409);
     return { status: run.id === runId ? "pending" : "replay", run,
-      receipt: results[6].results[0] || null };
+      receipt: results[7].results[0] || null };
   }
-  const limits = results[7].results[0];
+  if (epochUnavailable(results[9].results[0], fingerprint)) {
+    throw new StoreError("admission_unavailable", 503);
+  }
+  const limits = results[8].results[0];
   if (!limits.owned) throw new StoreError("not_found", 404);
   if (limits.message_count !== data.expected_message_count) throw new StoreError("context_changed", 409);
   if (limits.unresolved) throw new StoreError("conversation_unresolved", 409);
@@ -398,6 +471,7 @@ export default {
       if (url.pathname === "/healthz" && request.method === "GET" && !url.search) {
         return json({ evidence_class: "DECLARED", source_revision: revision(env),
           database_bound: Boolean(env.DB), authentication_configured: configuredSecret(env),
+          admission_configured: configuredAdmissionSecret(env),
           storage_readiness: "UNKNOWN", receipt_minted: false });
       }
       if (url.pathname !== "/v1/store" || url.search) throw new StoreError("not_found", 404);
@@ -405,17 +479,20 @@ export default {
       if (!configuredSecret(env) || !env.DB) throw new StoreError("store_unavailable", 503);
       if (!await authorized(request, env.STORE_SECRET)) throw new StoreError("unauthorized", 401);
       const data = await boundedJson(request);
+      if (!configuredAdmissionSecret(env) && !["purge", "complete", "uncertain"].includes(data?.op)) {
+        throw new StoreError("store_unavailable", 503);
+      }
       if (data?.op === "check") {
         fields(data, ["op"]);
-        return json(await check(env.DB));
+        return json(await check(env.DB, env.ADMISSION_SECRET));
       }
       string(data?.owner, 64, OWNER);
       let result;
       switch (data?.op) {
         case "list": result = await list(env.DB, data); break;
-        case "create": result = await create(env.DB, data, revision(env), env.STORE_SECRET); break;
+        case "create": result = await create(env.DB, data, revision(env), env.ADMISSION_SECRET); break;
         case "get": result = await get(env.DB, data); break;
-        case "reserve": result = await reserve(env.DB, data, revision(env), env.STORE_SECRET); break;
+        case "reserve": result = await reserve(env.DB, data, revision(env), env.ADMISSION_SECRET); break;
         case "complete":
         case "uncertain": result = await finish(env.DB, data, revision(env)); break;
         case "purge": result = await purge(env.DB, data, revision(env)); break;

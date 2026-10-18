@@ -32,10 +32,27 @@ and kept in Space secrets. `STORE_URL` is the exact HTTPS workers.dev origin of
 the dedicated storage Worker, and `STORE_SECRET` is its independently generated
 server credential. Never use an existing local Studio or operator credential.
 
-Worker bindings: `DB` to the dedicated D1 database, secret `STORE_SECRET`, and
-`SOURCE_REVISION` to the admitted GitHub SHA. Apply `edge/schema.sql` only to the
-identified new database, after permission and billing readback. Configure Worker
-logs/traces without recording Authorization, cookies, prompts or responses.
+Worker bindings: `DB` to the dedicated D1 database, secret `STORE_SECRET`, an
+independently generated `ADMISSION_SECRET`, and `SOURCE_REVISION` to the admitted
+GitHub SHA. The two secrets must be distinct. Keep `ADMISSION_SECRET` stable
+through each UTC day when rotating `STORE_SECRET`: the first admission records a
+day-bound, non-account fingerprint of the admission key. An unexpected same-day
+admission-key change holds new admissions even after account erasure; restore
+the original key or wait until the next UTC day. Never rewrite the fingerprint
+to clear a hold. Missing admission-key configuration leaves readiness and new
+admissions unavailable, while authenticated completion, uncertainty recording,
+and account erasure remain available for existing data.
+
+For an identified new database, apply `edge/schema.sql` after permission and
+billing readback. For an existing version-1 database, preserve and back it up,
+then apply only the additive `edge/migrations/0002_admission_key_epoch.sql`.
+The `studio_schema` row remains version 1; readiness requires its version 1 and
+the separate admission epoch feature version 1. If the old database has current
+UTC-day admissions without a known key epoch, readiness and new admissions
+remain held until the next UTC day. Do not backfill or reset those counters.
+No live D1 migration or deployment is claimed by these source instructions.
+Configure Worker logs/traces without recording Authorization, cookies, prompts
+or responses.
 Use the current `cf` CLI and official configuration schema for deployment;
 this repository does not introduce a second automatic publisher.
 
@@ -76,12 +93,15 @@ page. Deletion removes live D1 account rows and signs out the requesting
 browser after a confirmed storage response. It does not close the Hugging Face
 account or revoke another browser's 8-hour session. Day-specific pseudonymous
 usage counters remain until the first successful storage write after that UTC
-day, so erasure cannot reset daily admission. Keep the Worker secret stable
-through each UTC day; rotating it resets the keyed counters. D1 Time Travel
-may retain recoverable history for 7 days (Free) or 30 days (Paid), so deletion
-is not immediate from backups. There is no automatic age-based retention or legal
-review in this source slice. Do not enable public signup until privacy terms,
-real identity/persistence checks, plan and backup horizon are confirmed live.
+day, so erasure cannot reset daily admission. A separate, day-bound fingerprint
+of the admission key is not account-linked and is retained without automatic
+expiry. Rotating `STORE_SECRET` does not reset owner counters; changing
+`ADMISSION_SECRET` during an admitted UTC day holds new admissions. D1 Time
+Travel may retain recoverable history for 7 days (Free) or 30 days (Paid), so
+deletion is not immediate from backups. There is no automatic age-based
+retention or legal review in this source slice. Do not enable public signup
+until privacy terms, real identity/persistence checks, plan and backup horizon
+are confirmed live.
 
 Prior art: [HF OAuth](https://huggingface.co/docs/hub/en/spaces-oauth),
 [Authlib OIDC](https://docs.authlib.org/en/latest/client/flask.html),
