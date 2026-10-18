@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from datetime import timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -43,6 +44,36 @@ RESPONSE_WINDOW_BYTES = 65535
 UUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 LIMITS = {"prompt_characters": 2000, "output_tokens": MAX_OUTPUT_TOKENS,
           "daily_user_runs": 20, "daily_global_runs": 200, "conversations": 100}
+DIAGNOSTIC_WINDOW_SECONDS = 60
+DIAGNOSTIC_GLOBAL_LIMIT = 30
+DIAGNOSTIC_OWNER_LIMIT = 6
+DIAGNOSTIC_INFLIGHT_LIMIT = 2
+
+
+class DiagnosticBudget:
+    def __init__(self, clock=time.monotonic):
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._recent = deque()
+        self._inflight = 0
+
+    def acquire(self, owner):
+        with self._lock:
+            now = self._clock()
+            while self._recent and now - self._recent[0][0] >= DIAGNOSTIC_WINDOW_SECONDS:
+                self._recent.popleft()
+            owner_count = sum(saved_owner == owner for _, saved_owner in self._recent)
+            if (self._inflight >= DIAGNOSTIC_INFLIGHT_LIMIT
+                    or len(self._recent) >= DIAGNOSTIC_GLOBAL_LIMIT
+                    or owner_count >= DIAGNOSTIC_OWNER_LIMIT):
+                return False
+            self._recent.append((now, owner))
+            self._inflight += 1
+            return True
+
+    def release(self):
+        with self._lock:
+            self._inflight -= 1
 
 
 class ApiError(Exception):
@@ -718,6 +749,8 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
     app.extensions["studio_store"] = store
     app.extensions["studio_engine"] = engine
     app.extensions["studio_oauth_client"] = oauth_client
+    diagnostic_budget = DiagnosticBudget()
+    app.extensions["studio_diagnostic_budget"] = diagnostic_budget
 
     def current_user():
         user = session.get("user")
@@ -735,26 +768,31 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
             raise ApiError("authentication_required", 401)
         return user
 
-    def store_diagnostic():
-        compare = getattr(store, "compare_once", None)
-        if compare is not None:
-            try:
-                compare()
-            except Exception as exc:
-                print("store_transport correlation=compare phase=compare result=probe_error error="
-                      + type(exc).__name__, file=sys.stderr, flush=True)
+    def store_diagnostic(owner):
+        if not diagnostic_budget.acquire(owner):
+            return {"ok": False, "failure": None, "deferred": True}
         try:
-            result = store.call("check")
-        except ApiError as exc:
-            return {"ok": False, "failure": exc.reason or "connect_failure"}
-        schema_version = result.get("schema_version")
-        admission_epoch_version = result.get("admission_epoch_version")
-        matched = (result.get("status") == "available" and type(schema_version) is int
-                   and schema_version == 1 and type(admission_epoch_version) is int
-                   and admission_epoch_version == 1 and result.get("receipt_minted") is False)
-        if matched:
-            return {"ok": True, "failure": None}
-        return {"ok": False, "failure": "schema_mismatch"}
+            compare = getattr(store, "compare_once", None)
+            if compare is not None:
+                try:
+                    compare()
+                except Exception as exc:
+                    print("store_transport correlation=compare phase=compare result=probe_error error="
+                          + type(exc).__name__, file=sys.stderr, flush=True)
+            try:
+                result = store.call("check")
+            except ApiError as exc:
+                return {"ok": False, "failure": exc.reason or "connect_failure"}
+            schema_version = result.get("schema_version")
+            admission_epoch_version = result.get("admission_epoch_version")
+            matched = (result.get("status") == "available" and type(schema_version) is int
+                       and schema_version == 1 and type(admission_epoch_version) is int
+                       and admission_epoch_version == 1 and result.get("receipt_minted") is False)
+            if matched:
+                return {"ok": True, "failure": None}
+            return {"ok": False, "failure": "schema_mismatch"}
+        finally:
+            diagnostic_budget.release()
 
     def csrf_check(form=False):
         if not valid_origin(origin) or request.headers.get("Origin") != origin:
@@ -825,11 +863,13 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
     @app.get("/readyz")
     def ready():
         user = current_user()
-        diagnostic = store_diagnostic() if user else {"ok": False, "failure": None}
+        diagnostic = store_diagnostic(user["owner"]) if user else {"ok": False, "failure": None}
         result = {"auth": auth_ready, "store": diagnostic["ok"], "model": bool(engine.ready)}
         body = {"ready": result, "receipt_minted": False}
-        if not user:
+        if not user or diagnostic.get("deferred"):
             body["store_evidence"] = "UNKNOWN"
+        if diagnostic.get("deferred"):
+            body["store_check_deferred"] = True
         if diagnostic["failure"]:
             body["store_failure"] = diagnostic["failure"]
         return jsonify(body), 200 if all(result.values()) else 503
@@ -840,13 +880,15 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
         if "csrf" not in session:
             session["csrf"] = secrets.token_urlsafe(32)
         user = current_user()
-        diagnostic = store_diagnostic() if user else {"ok": False, "failure": None}
+        diagnostic = store_diagnostic(user["owner"]) if user else {"ok": False, "failure": None}
         body = {"user": {"name": user["name"]} if user else None,
                 "csrf": session["csrf"], "limits": LIMITS,
                 "ready": {"auth": auth_ready, "store": diagnostic["ok"],
                           "model": bool(engine.ready)}}
-        if not user:
+        if not user or diagnostic.get("deferred"):
             body["store_evidence"] = "UNKNOWN"
+        if diagnostic.get("deferred"):
+            body["store_check_deferred"] = True
         if diagnostic["failure"]:
             body["store_failure"] = diagnostic["failure"]
         return jsonify(body)

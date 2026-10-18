@@ -28,7 +28,8 @@ function controls() {
   $("identity").textContent = session?.user?.name || "Not signed in";
   const storageDown = Boolean(session?.store_failure);
   $("status").textContent = busy ? "Running" : ready ? "Available"
-    : storageDown ? "Storage unavailable" : signedIn ? "Unavailable" : "Sign in";
+    : storageDown ? "Storage unavailable" : session?.store_check_deferred
+      ? "Check deferred" : signedIn ? "Unavailable" : "Sign in";
   $("status").classList.toggle("error", (signedIn && !ready) || storageDown);
 }
 function storageMessage(failure) {
@@ -120,7 +121,8 @@ async function openConversation(id) {
 async function reload() {
   session = await api("/api/session");
   controls();
-  notice(session.store_failure ? storageMessage(session.store_failure) : "");
+  notice(session.store_failure ? storageMessage(session.store_failure)
+    : session.store_check_deferred ? "Availability could not be verified yet. Refresh shortly." : "");
   if (session.user) {
     const data = await api("/api/conversations");
     conversations = data.conversations;
