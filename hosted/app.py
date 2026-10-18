@@ -789,11 +789,10 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
     def response_headers(response):
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "same-origin"
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; "
-            "connect-src 'self'; frame-ancestors 'none'; object-src 'none'; "
+            "connect-src 'self'; frame-ancestors https://huggingface.co; object-src 'none'; "
             "base-uri 'none'; form-action 'self' https://huggingface.co"
         )
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"

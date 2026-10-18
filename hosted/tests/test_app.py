@@ -183,6 +183,22 @@ class HostedAppTests(unittest.TestCase):
         return self.post("/api/runs", {"conversation_id": CONVERSATION_ID,
                                       "prompt": prompt, "idempotency_key": key})
 
+    def test_hub_embedding_has_exact_frame_ancestor(self):
+        for path in ("/", "/api/session", "/static/privacy.html"):
+            response = self.client.get(path, **self.base)
+            try:
+                self.assertEqual(response.status_code, 200)
+                self.assertNotIn("X-Frame-Options", response.headers)
+                policy = response.headers["Content-Security-Policy"]
+                frame_directives = [directive.strip() for directive in policy.split(";")
+                                    if directive.strip().startswith("frame-ancestors")]
+                self.assertEqual(frame_directives, ["frame-ancestors https://huggingface.co"])
+                self.assertIn("script-src 'self'", policy)
+                self.assertIn("form-action 'self' https://huggingface.co", policy)
+                self.assertEqual(response.headers["Referrer-Policy"], "same-origin")
+            finally:
+                response.close()
+
     def test_oauth_callback_checks_issuer_and_does_not_persist_token(self):
         self.oauth.userinfo["iss"] = "https://other.example"
         response = self.client.get("/auth/callback", **self.base)
@@ -206,10 +222,21 @@ class HostedAppTests(unittest.TestCase):
             response = self.post("/api/conversations", payload, origin=origin, csrf=csrf)
             self.assertEqual(response.status_code, 403)
         self.assertEqual(self.store.calls, [])
-        response = self.client.post("/auth/login", data={"csrf": "synthetic-csrf"},
-                                    headers={"Origin": "https://other.example"}, **self.base)
-        self.assertEqual(response.status_code, 403)
+        for origin in ("https://other.example", "null", None):
+            headers = {"Origin": origin} if origin is not None else {}
+            response = self.client.post("/auth/login", data={"csrf": "synthetic-csrf"},
+                                        headers=headers, **self.base)
+            self.assertEqual(response.status_code, 403)
         self.assertEqual(self.oauth.redirects, 0)
+
+    def test_first_party_form_login_keeps_origin_and_csrf_gate(self):
+        with self.client.session_transaction(base_url=ORIGIN) as browser:
+            browser["csrf"] = "synthetic-csrf"
+        response = self.client.post("/auth/login", data={"csrf": "synthetic-csrf"},
+                                    headers={"Origin": ORIGIN}, **self.base)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response.headers["Location"], ISSUER + "/oauth/authorize")
+        self.assertEqual(self.oauth.redirects, 1)
 
     def test_cross_owner_conversation_is_not_readable(self):
         self.sign_in("different-user")

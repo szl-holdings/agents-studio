@@ -146,7 +146,12 @@ $("refresh").onclick = () => { if (!busy) reload().catch(reportLoad); };
 $("menu").onclick = () => document.body.classList.toggle("menu-open");
 $("search").oninput = renderList;
 $("prompt").oninput = () => { $("counter").textContent = `${$("prompt").value.length} / 2,000`; controls(); };
+if (window.top !== window) $("login-label").textContent = "Open sign-in tab";
 $("login").onclick = () => {
+  if (window.top !== window) {
+    window.open("/", "_blank", "noopener,noreferrer");
+    return;
+  }
   const form = document.createElement("form");
   form.method = "POST"; form.action = "/auth/login";
   const csrf = document.createElement("input");
