@@ -32,6 +32,7 @@ class FakeStore:
         self.stale = False
         self.lose_complete_response = False
         self.fail_get_after = None
+        self.substitute_model_binding = False
         self._gets = 0
         self.other_messages = [{"owner": owner_key("other"), "content": "Private other data"}]
 
@@ -41,7 +42,8 @@ class FakeStore:
             raise ApiError("store_unavailable", 503)
         if op == "check":
             return {"status": "available", "schema_version": 1,
-                    "admission_epoch_version": 1, "receipt_minted": False}
+                    "admission_epoch_version": 1, "model_binding_enforced": True,
+                    "receipt_minted": False}
         if op == "list":
             return {"conversations": [{"owner": data["owner"], "id": CONVERSATION_ID}],
                     "receipt_minted": False}
@@ -62,10 +64,17 @@ class FakeStore:
             run = {"id": str(uuid.uuid4()), "owner": data["owner"],
                    "conversation_id": data["conversation_id"],
                    "idempotency_key": data["idempotency_key"], "prompt": data["prompt"],
-                   "max_output_tokens": data["max_output_tokens"], "state": "pending"}
+                   "max_output_tokens": data["max_output_tokens"], "state": "pending",
+                   "model_id": data["model_binding"]["id"],
+                   "model_revision": data["model_binding"]["revision"],
+                   "model_weights_sha256": data["model_binding"]["weights_sha256"],
+                   "model_binding_evidence": "DECLARED"}
             self.runs.append(run)
             self.messages.append({"role": "user", "content": data["prompt"]})
-            return {"status": "pending", "run": copy.deepcopy(run)}
+            returned = copy.deepcopy(run)
+            if self.substitute_model_binding:
+                returned["model_weights_sha256"] = "0" * 64
+            return {"status": "pending", "run": returned}
         if op == "complete":
             run = next(item for item in self.runs if item["id"] == data["run_id"])
             run["state"] = "completed"
@@ -100,9 +109,16 @@ class FakeEngine:
         self.admissions = []
         self.generations = 0
         self.active = 0
+        self.weights_verified = True
+        self.model_id = "synthetic/model"
+        self.model_revision = "a" * 40
+        self.model_weights_sha256 = "b" * 64
 
     def identity(self):
-        return {"state": "MEASURED" if self.ready else "UNAVAILABLE"}
+        return {"state": "SIMULATED" if self.ready else "UNAVAILABLE",
+                "model": self.model_id, "revision": self.model_revision,
+                "weights_sha256": self.model_weights_sha256,
+                "weights_verified": self.weights_verified if self.ready else False}
 
     @contextmanager
     def admission(self, messages):
@@ -278,6 +294,44 @@ class HostedAppTests(unittest.TestCase):
         self.assertEqual(self.engine.active, 0)
         self.assertEqual(self.engine.generations, 0)
 
+    def test_new_run_binds_model_before_dispatch(self):
+        self.sign_in()
+        response = self.run_request()
+        self.assertEqual(response.status_code, 200)
+        binding = next(data["model_binding"] for op, data in self.store.calls if op == "reserve")
+        self.assertEqual(binding, {"id": "synthetic/model", "revision": "a" * 40,
+                                   "weights_sha256": "b" * 64})
+        self.assertEqual(response.json["run"]["model_id"], binding["id"])
+        self.assertEqual(response.json["run"]["model_binding_evidence"], "DECLARED")
+        self.assertEqual(self.engine.generations, 1)
+
+    def test_unverified_or_malformed_model_cannot_reserve(self):
+        self.sign_in()
+        for field, value in [("weights_verified", False), ("model_revision", "bad"),
+                             ("model_id", "https://unexpected.example/model")]:
+            original = getattr(self.engine, field)
+            setattr(self.engine, field, value)
+            response = self.run_request()
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.json["error"], "model_unavailable")
+            self.assertEqual([op for op, _ in self.store.calls if op == "reserve"], [])
+            self.assertEqual(self.engine.generations, 0)
+            setattr(self.engine, field, original)
+        with mock.patch.object(self.engine, "identity", side_effect=ValueError("synthetic failure")):
+            response = self.run_request()
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json["error"], "model_unavailable")
+        self.assertEqual([op for op, _ in self.store.calls if op == "reserve"], [])
+
+    def test_substituted_model_binding_never_dispatches(self):
+        self.sign_in()
+        self.store.substitute_model_binding = True
+        response = self.run_request()
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json["error"], "store_unavailable")
+        self.assertEqual(self.engine.generations, 0)
+        self.assertEqual(self.engine.active, 0)
+
     def test_replay_never_redispatches_even_when_model_busy(self):
         self.sign_in()
         first = self.run_request()
@@ -291,6 +345,11 @@ class HostedAppTests(unittest.TestCase):
         self.assertEqual(repeated.json["status"], "completed")
         self.assertEqual(self.engine.generations, 1)
         self.assertEqual([op for op, _ in self.store.calls].count("reserve"), 1)
+        self.engine.model_revision = "c" * 40
+        repeated_again = self.run_request()
+        self.assertTrue(repeated_again.json["replay"])
+        self.assertEqual(repeated_again.json["run"]["model_revision"], "a" * 40)
+        self.assertEqual(self.engine.generations, 1)
         conflict = self.run_request(prompt="Changed prompt")
         self.assertEqual(conflict.status_code, 409)
         self.assertEqual(conflict.json["error"], "idempotency_conflict")
@@ -581,6 +640,24 @@ class HostedAppTests(unittest.TestCase):
                     return super().call(op, **data)
 
             self.rebuild(EpochStore())
+            self.sign_in()
+            response = self.client.get("/readyz", **self.base)
+            self.assertEqual(response.status_code, 503)
+            self.assertEqual(response.json["store_failure"], "schema_mismatch")
+
+    def test_model_binding_cutover_must_be_enforced_for_readiness(self):
+        for enforced in (None, False, 1):
+            class PreCutoverStore(FakeStore):
+                def call(self, op, **data):
+                    if op == "check":
+                        self.calls.append((op, copy.deepcopy(data)))
+                        return {"status": "available", "schema_version": 1,
+                                "admission_epoch_version": 1,
+                                "model_binding_enforced": enforced,
+                                "receipt_minted": False}
+                    return super().call(op, **data)
+
+            self.rebuild(PreCutoverStore())
             self.sign_in()
             response = self.client.get("/readyz", **self.base)
             self.assertEqual(response.status_code, 503)

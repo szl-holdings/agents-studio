@@ -48,11 +48,21 @@ and account erasure remain available for existing data.
 
 For an identified new database, apply `edge/schema.sql` after permission and
 billing readback. For an existing version-1 database, preserve and back it up,
-then apply only the additive `edge/migrations/0002_admission_key_epoch.sql`.
-The `studio_schema` row remains version 1; readiness requires its version 1 and
-the separate admission epoch feature version 1. If the old database has current
-UTC-day admissions without a known key epoch, readiness and new admissions
-remain held until the next UTC day. Do not backfill or reset those counters.
+then apply the additive migrations in order: `edge/migrations/0002_admission_key_epoch.sql`
+and `edge/migrations/0003_run_model_bindings.sql`. For a database that already
+has migration 0002, apply only 0003. Stage the cutover: back up the identified
+database, apply the migration, deploy the compatible Worker, deploy the Space
+that sends and verifies model pins, then set the Worker's
+`REQUIRE_MODEL_BINDING=1`. Read back a fresh authenticated `check` showing
+`model_binding_enforced: true` and a new run with the expected declared pin.
+Before the exact flag flip, old clients may still reserve unpinned runs; label
+their model binding `UNKNOWN`. The new table does not backfill old runs, which
+also remain `UNKNOWN`. Only the exact value `1` enables enforcement.
+The `studio_schema` row remains version 1; readiness requires its version 1,
+the separate admission epoch feature version 1, and the model-binding table.
+If the old database has current UTC-day admissions without a known key epoch,
+readiness and new admissions remain held until the next UTC day. Do not backfill
+or reset those counters.
 No live D1 migration or deployment is claimed by these source instructions.
 Configure Worker logs/traces without recording Authorization, cookies, prompts
 or responses.

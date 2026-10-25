@@ -61,6 +61,17 @@ CREATE INDEX IF NOT EXISTS runs_owner_day ON runs (owner, quota_day);
 CREATE INDEX IF NOT EXISTS runs_day ON runs (quota_day);
 CREATE INDEX IF NOT EXISTS runs_conversation ON runs (owner, conversation_id, created_at);
 
+-- A declared model pin belongs to one admitted run and is erased with it.
+-- Existing runs are intentionally not backfilled with an inferred identity.
+CREATE TABLE IF NOT EXISTS run_model_bindings (
+  run_id TEXT PRIMARY KEY REFERENCES runs (id) ON DELETE CASCADE,
+  model_id TEXT NOT NULL CHECK (length(model_id) BETWEEN 1 AND 200),
+  model_revision TEXT NOT NULL CHECK (length(model_revision) = 40
+    AND model_revision NOT GLOB '*[^0-9a-f]*'),
+  model_weights_sha256 TEXT NOT NULL CHECK (length(model_weights_sha256) = 64
+    AND model_weights_sha256 NOT GLOB '*[^0-9a-f]*')
+);
+
 -- Run admission is independent of retained account history and cannot be reset by purge.
 CREATE TABLE IF NOT EXISTS run_admissions (
   day TEXT PRIMARY KEY,

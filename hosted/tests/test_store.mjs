@@ -6,6 +6,7 @@ import worker from "../edge/store.mjs";
 
 const schema = readFileSync(new URL("../edge/schema.sql", import.meta.url), "utf8");
 const migration = readFileSync(new URL("../edge/migrations/0002_admission_key_epoch.sql", import.meta.url), "utf8");
+const bindingMigration = readFileSync(new URL("../edge/migrations/0003_run_model_bindings.sql", import.meta.url), "utf8");
 const OWNER_A = "a".repeat(64);
 const OWNER_B = "b".repeat(64);
 const SECRET = "synthetic-local-test-secret-not-for-deployment";
@@ -51,7 +52,7 @@ class LocalD1 {
   count(table) {
     assert.ok(["conversations", "conversation_admissions", "owner_conversation_admissions",
       "admission_epoch_schema", "admission_key_epochs",
-      "runs", "run_admissions", "owner_run_admissions", "messages",
+      "runs", "run_model_bindings", "run_admissions", "owner_run_admissions", "messages",
       "receipts", "erasure_receipts"].includes(table));
     return this.sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n;
   }
@@ -84,6 +85,11 @@ function reservation(id, changes = {}) {
   return { op: "reserve", owner: OWNER_A, conversation_id: id,
     idempotency_key: crypto.randomUUID(), prompt: "A synthetic question", max_output_tokens: 128,
     expected_message_count: 0, ...changes };
+}
+
+function modelBinding(changes = {}) {
+  return { id: "Qwen/Qwen2.5-0.5B-Instruct", revision: "a".repeat(40),
+    weights_sha256: "b".repeat(64), ...changes };
 }
 
 function completion(run, changes = {}) {
@@ -127,7 +133,7 @@ test("authenticated readiness checks schema without creating state", async (t) =
   const result = await call(env, { op: "check" });
   assert.equal(result.status, 200);
   assert.deepEqual(result.data, { status: "available", schema_version: 1,
-    admission_epoch_version: 1, receipt_minted: false });
+    admission_epoch_version: 1, model_binding_enforced: false, receipt_minted: false });
   assert.ok(env.DB.calls.every(({ sql }) => sql.trim().startsWith("SELECT")));
   assert.equal(env.DB.count("receipts"), 0);
   env.DB.failOn = "SELECT owner, conversation_id, run_id";
@@ -168,6 +174,26 @@ test("the additive migration retains version-1 schema and admission rows", (t) =
   assert.equal(db.prepare("SELECT admitted FROM run_admissions").get().admitted, 3);
   assert.equal(db.prepare("SELECT version FROM admission_epoch_schema WHERE id = 1").get().version, 1);
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM admission_key_epochs").get().n, 0);
+});
+
+test("model-binding migration is idempotent and preserves legacy run and admission rows", async (t) => {
+  const env = environment(t);
+  const id = await conversation(env);
+  const legacy = (await call(env, reservation(id))).data.run;
+  const admitted = env.DB.sqlite.prepare("SELECT admitted FROM run_admissions").get().admitted;
+  env.DB.sqlite.exec("DROP TABLE run_model_bindings");
+  assert.equal((await call(env, { op: "check" })).status, 503);
+  env.DB.sqlite.exec(bindingMigration);
+  env.DB.sqlite.exec(bindingMigration);
+  assert.equal((await call(env, { op: "check" })).status, 200);
+  assert.equal(env.DB.sqlite.prepare("SELECT version FROM studio_schema WHERE id = 1").get().version, 1);
+  assert.equal(env.DB.sqlite.prepare("SELECT admitted FROM run_admissions").get().admitted, admitted);
+  assert.equal(env.DB.count("runs"), 1);
+  assert.equal(env.DB.count("run_model_bindings"), 0);
+  const history = (await call(env, { op: "get", owner: OWNER_A, id })).data.runs[0];
+  assert.equal(history.id, legacy.id);
+  assert.deepEqual([history.model_id, history.model_revision, history.model_weights_sha256,
+    history.model_binding_evidence], [null, null, null, "UNKNOWN"]);
 });
 
 test("legacy current-day admissions hold until the next UTC day", async (t) => {
@@ -415,6 +441,106 @@ test("reservation persists prompt once, binds input and replays without dispatch
   assert.equal(env.DB.count("runs"), 1);
   assert.equal(env.DB.count("messages"), 1);
   assert.equal(env.DB.count("receipts"), 2);
+});
+
+test("model pin is stored once and returned on reserve, completion and history", async (t) => {
+  const env = environment(t);
+  const id = await conversation(env);
+  const binding = modelBinding();
+  const request = reservation(id, { model_binding: binding });
+  const first = await call(env, request);
+  assert.equal(first.data.status, "pending");
+  assert.deepEqual([first.data.run.model_id, first.data.run.model_revision,
+    first.data.run.model_weights_sha256, first.data.run.model_binding_evidence],
+  [binding.id, binding.revision, binding.weights_sha256, "DECLARED"]);
+  assert.equal(env.DB.count("run_model_bindings"), 1);
+  const replay = await call(env, { ...request,
+    model_binding: modelBinding({ revision: "c".repeat(40) }) });
+  assert.equal(replay.data.status, "replay");
+  assert.equal(replay.data.run.model_revision, binding.revision);
+  assert.equal(replay.data.receipt, null);
+  assert.equal(env.DB.count("run_model_bindings"), 1);
+  const complete = await call(env, completion(first.data.run));
+  assert.equal(complete.data.status, "completed");
+  assert.equal(complete.data.run.model_binding_evidence, "DECLARED");
+  assert.equal(complete.data.run.model_weights_sha256, binding.weights_sha256);
+  const history = (await call(env, { op: "get", owner: OWNER_A, id })).data;
+  assert.equal(history.runs[0].model_id, binding.id);
+  assert.equal(history.runs[0].model_revision, binding.revision);
+  assert.equal(history.runs[0].model_weights_sha256, binding.weights_sha256);
+  assert.equal(history.runs[0].model_binding_evidence, "DECLARED");
+});
+
+test("legacy reservation replays without acquiring a later model pin", async (t) => {
+  const env = environment(t);
+  const id = await conversation(env);
+  const request = reservation(id);
+  const legacy = await call(env, request);
+  assert.equal(legacy.data.run.model_binding_evidence, "UNKNOWN");
+  const replay = await call(env, { ...request, model_binding: modelBinding() });
+  assert.equal(replay.data.status, "replay");
+  assert.deepEqual([replay.data.run.model_id, replay.data.run.model_revision,
+    replay.data.run.model_weights_sha256, replay.data.run.model_binding_evidence],
+  [null, null, null, "UNKNOWN"]);
+  assert.equal(env.DB.count("run_model_bindings"), 0);
+  const done = await call(env, completion(legacy.data.run));
+  assert.equal(done.data.run.model_binding_evidence, "UNKNOWN");
+});
+
+test("exact model-binding enforcement is visible and rejects legacy reserve before D1", async (t) => {
+  const env = environment(t);
+  const id = await conversation(env);
+  assert.equal((await call(env, reservation(id))).data.status, "pending");
+  const legacyId = await conversation(env);
+  const enforced = { ...env, REQUIRE_MODEL_BINDING: "1" };
+  const check = await call(enforced, { op: "check" });
+  assert.equal(check.data.model_binding_enforced, true);
+  assert.equal(check.data.receipt_minted, false);
+  assert.equal((await call({ ...env, REQUIRE_MODEL_BINDING: "true" },
+    { op: "check" })).data.model_binding_enforced, false);
+  const before = env.DB.calls.length;
+  const denied = await call(enforced, reservation(legacyId));
+  assert.equal(denied.status, 400);
+  assert.deepEqual(denied.data, { error: "model_binding_required" });
+  assert.equal(env.DB.calls.length, before);
+  assert.equal(env.DB.count("runs"), 1);
+  assert.equal(env.DB.count("run_model_bindings"), 0);
+  const pinned = await call(enforced, reservation(legacyId, { model_binding: modelBinding() }));
+  assert.equal(pinned.data.status, "pending");
+  assert.equal(pinned.data.run.model_binding_evidence, "DECLARED");
+});
+
+test("malformed model pins are rejected before admission or content writes", async (t) => {
+  const env = environment(t);
+  const id = await conversation(env);
+  for (const invalid of [null, [], {}, modelBinding({ id: "../escape" }),
+    modelBinding({ id: "Qwen//model" }), modelBinding({ id: "Qwen/model/extra" }),
+    modelBinding({ id: "Qwen/model?revision=main" }), modelBinding({ id: "a".repeat(201) }),
+    modelBinding({ revision: "A".repeat(40) }), modelBinding({ revision: "a".repeat(39) }),
+    modelBinding({ weights_sha256: "B".repeat(64) }),
+    modelBinding({ weights_sha256: "b".repeat(63) }),
+    modelBinding({ extra: "field" })]) {
+    const result = await call(env, reservation(id, { model_binding: invalid }));
+    assert.equal(result.status, 400);
+  }
+  assert.equal(env.DB.count("runs"), 0);
+  assert.equal(env.DB.count("run_model_bindings"), 0);
+  assert.equal(env.DB.count("messages"), 0);
+  assert.equal(env.DB.count("run_admissions"), 0);
+  assert.equal(env.DB.count("receipts"), 1);
+});
+
+test("failed model-binding insert rolls back the full reservation batch", async (t) => {
+  const env = environment(t);
+  const id = await conversation(env);
+  env.DB.failOn = "INSERT INTO run_model_bindings";
+  assert.equal((await call(env, reservation(id, { model_binding: modelBinding() }))).status, 503);
+  assert.deepEqual([env.DB.count("runs"), env.DB.count("run_model_bindings"),
+    env.DB.count("messages"), env.DB.count("run_admissions"), env.DB.count("receipts")],
+  [0, 0, 0, 0, 1]);
+  env.DB.failOn = null;
+  assert.equal((await call(env, reservation(id, { model_binding: modelBinding() }))).data.status,
+    "pending");
 });
 
 test("concurrent same-key reservations create exactly one new pending run", async (t) => {
@@ -684,6 +810,24 @@ test("purge deletes one owner's content and receipts with an owner-free durable 
   assert.deepEqual(replay.data.deleted, { messages: 0, runs: 0, receipts: 0, conversations: 0 });
   assert.equal(replay.data.receipt, null);
   assert.equal(env.DB.count("erasure_receipts"), 1);
+});
+
+test("purge cascades model pins only for the erased owner's runs", async (t) => {
+  const env = environment(t);
+  const idA = await conversation(env);
+  const idB = await conversation(env, OWNER_B);
+  const runA = (await call(env, reservation(idA, { model_binding: modelBinding() }))).data.run;
+  const runB = (await call(env, reservation(idB, { owner: OWNER_B,
+    model_binding: modelBinding({ id: "SZLHOLDINGS/held-model" }) }))).data.run;
+  assert.equal(env.DB.count("run_model_bindings"), 2);
+  assert.equal((await call(env, { op: "purge", owner: OWNER_A })).data.status, "deleted");
+  assert.equal(env.DB.count("run_model_bindings"), 1);
+  assert.equal(env.DB.sqlite.prepare("SELECT * FROM run_model_bindings WHERE run_id = ?").get(runA.id),
+    undefined);
+  assert.equal(env.DB.sqlite.prepare("SELECT model_id FROM run_model_bindings WHERE run_id = ?")
+    .get(runB.id).model_id, "SZLHOLDINGS/held-model");
+  const remaining = (await call(env, { op: "get", owner: OWNER_B, id: idB })).data.runs[0];
+  assert.equal(remaining.model_binding_evidence, "DECLARED");
 });
 
 test("purge rolls back all deletes if its receipt or a delete fails", async (t) => {
