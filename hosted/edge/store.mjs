@@ -4,6 +4,9 @@ const MAX_OUTPUT_BYTES = 8192;
 const OWNER = /^[a-f0-9]{64}$/;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const IDENTIFIER = /^[A-Za-z0-9._:-]+$/;
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)?$/;
+const REVISION = /^[a-f0-9]{40}$/;
+const SHA256 = /^[a-f0-9]{64}$/;
 const HEADERS = {
   "content-type": "application/json; charset=utf-8",
   "cache-control": "no-store",
@@ -63,6 +66,10 @@ function configuredSecret(env) {
 
 function configuredAdmissionSecret(env) {
   return validSecret(env.ADMISSION_SECRET) && env.ADMISSION_SECRET !== env.STORE_SECRET;
+}
+
+function modelBindingEnforced(env) {
+  return env.REQUIRE_MODEL_BINDING === "1";
 }
 
 const EPOCH_GUARD = `(
@@ -171,8 +178,12 @@ function readReceipt(db, owner, id) {
 }
 
 function readRun(db, owner, id) {
-  return prepared(db, "SELECT * FROM runs WHERE owner = ? AND id = ?", [owner, id]);
+  return prepared(db, `${RUN_WITH_BINDING} WHERE r.owner = ? AND r.id = ?`, [owner, id]);
 }
+
+const RUN_WITH_BINDING = `SELECT r.*, b.model_id, b.model_revision, b.model_weights_sha256,
+  CASE WHEN b.run_id IS NULL THEN 'UNKNOWN' ELSE 'DECLARED' END AS model_binding_evidence
+  FROM runs r LEFT JOIN run_model_bindings b ON b.run_id = r.id`;
 
 async function ownerAdmissionTag(secret, kind, day, owner) {
   const key = await crypto.subtle.importKey("raw", encoder.encode(secret),
@@ -196,7 +207,7 @@ function cleanupExpiredAdmissions(db, day, receiptId, erasure = false) {
       AND EXISTS (SELECT 1 FROM ${marker} WHERE id = ?)`, [day, receiptId]));
 }
 
-async function check(db, admissionSecret) {
+async function check(db, admissionSecret, bindingEnforced) {
   const day = new Date().toISOString().slice(0, 10);
   const fingerprint = await admissionKeyFingerprint(admissionSecret);
   const rows = await batch(db, [
@@ -207,6 +218,8 @@ async function check(db, admissionSecret) {
     prepared(db, `SELECT id, owner, conversation_id, idempotency_key, input_digest,
       state, prompt, max_output_tokens, output, output_tokens, provider_response_id,
       quota_day, created_at, finished_at FROM runs LIMIT 0`),
+    prepared(db, `SELECT run_id, model_id, model_revision, model_weights_sha256
+      FROM run_model_bindings LIMIT 0`),
     prepared(db, "SELECT day, admitted FROM run_admissions LIMIT 0"),
     prepared(db, "SELECT day, owner_tag, admitted FROM owner_run_admissions LIMIT 0"),
     prepared(db, "SELECT owner, conversation_id, run_id, role, content, created_at FROM messages LIMIT 0"),
@@ -218,10 +231,11 @@ async function check(db, admissionSecret) {
     prepared(db, "SELECT day, key_fingerprint FROM admission_key_epochs LIMIT 0"),
     epochState(db, day),
   ]);
-  if (rows[0].results[0]?.version !== 1 || epochUnavailable(rows[12].results[0], fingerprint)) {
+  if (rows[0].results[0]?.version !== 1 || epochUnavailable(rows[13].results[0], fingerprint)) {
     throw new StoreError("schema_unavailable", 503);
   }
-  return { status: "available", schema_version: 1, admission_epoch_version: 1, receipt_minted: false };
+  return { status: "available", schema_version: 1, admission_epoch_version: 1,
+    model_binding_enforced: bindingEnforced, receipt_minted: false };
 }
 
 async function create(db, data, source, admissionSecret) {
@@ -287,22 +301,31 @@ async function get(db, data) {
     prepared(db, "SELECT * FROM conversations WHERE owner = ? AND id = ?", [data.owner, data.id]),
     prepared(db, `SELECT * FROM messages WHERE owner = ? AND conversation_id = ?
       ORDER BY created_at DESC, run_id DESC, role ASC LIMIT 100`, [data.owner, data.id]),
-    prepared(db, `SELECT * FROM runs WHERE owner = ? AND conversation_id = ?
-      ORDER BY created_at DESC, id DESC LIMIT 100`, [data.owner, data.id]),
+    prepared(db, `${RUN_WITH_BINDING} WHERE r.owner = ? AND r.conversation_id = ?
+      ORDER BY r.created_at DESC, r.id DESC LIMIT 100`, [data.owner, data.id]),
   ]);
   if (!results[0].results[0]) throw new StoreError("not_found", 404);
   return { conversation: results[0].results[0], messages: results[1].results.reverse(),
     runs: results[2].results.reverse(), receipt_minted: false };
 }
 
-async function reserve(db, data, source, admissionSecret) {
+async function reserve(db, data, source, admissionSecret, bindingEnforced) {
   fields(data, ["op", "owner", "conversation_id", "idempotency_key", "prompt", "max_output_tokens",
-    "expected_message_count"]);
+    "expected_message_count"], ["model_binding"]);
+  if (bindingEnforced && !Object.hasOwn(data, "model_binding")) {
+    throw new StoreError("model_binding_required");
+  }
   string(data.conversation_id, 36, UUID);
   string(data.idempotency_key, 128, IDENTIFIER);
   string(data.prompt, 2000);
   integer(data.max_output_tokens, 1, 128);
   integer(data.expected_message_count, 0, 19);
+  if (Object.hasOwn(data, "model_binding")) {
+    fields(data.model_binding, ["id", "revision", "weights_sha256"]);
+    string(data.model_binding.id, 200, MODEL_ID);
+    string(data.model_binding.revision, 40, REVISION);
+    string(data.model_binding.weights_sha256, 64, SHA256);
+  }
   const digestBytes = await crypto.subtle.digest("SHA-256", encoder.encode(JSON.stringify({
     conversation_id: data.conversation_id, prompt: data.prompt, max_output_tokens: data.max_output_tokens,
   })));
@@ -315,6 +338,13 @@ async function reserve(db, data, source, admissionSecret) {
   const ownerTag = await ownerAdmissionTag(admissionSecret, "run", day, data.owner);
   // D1 batch is transactional. The INSERT guards and unique partial index decide
   // reservation ownership together; separate read-then-write quota checks are unsafe.
+  const bindingStatement = data.model_binding ? [prepared(db, `INSERT INTO run_model_bindings
+    (run_id, model_id, model_revision, model_weights_sha256)
+    SELECT ?, ?, ?, ? WHERE changes() = 1
+    AND EXISTS (SELECT 1 FROM runs WHERE id = ? AND owner = ?)`,
+  [runId, data.model_binding.id, data.model_binding.revision,
+    data.model_binding.weights_sha256, runId, data.owner])] : [];
+  const readIndex = 6 + bindingStatement.length;
   const results = await batch(db, [
     prepared(db, `INSERT INTO runs (id, owner, conversation_id, idempotency_key,
       input_digest, state, prompt, max_output_tokens, quota_day, created_at)
@@ -346,7 +376,8 @@ async function reserve(db, data, source, admissionSecret) {
     prepared(db, `INSERT INTO messages (owner, conversation_id, run_id, role, content, created_at)
       SELECT owner, conversation_id, id, 'user', prompt, created_at FROM runs
       WHERE owner = ? AND id = ?`, [data.owner, runId]),
-    prepared(db, "SELECT * FROM runs WHERE owner = ? AND idempotency_key = ?",
+    ...bindingStatement,
+    prepared(db, `${RUN_WITH_BINDING} WHERE r.owner = ? AND r.idempotency_key = ?`,
       [data.owner, data.idempotency_key]),
     readReceipt(db, data.owner, receiptId),
     prepared(db, `SELECT
@@ -364,16 +395,16 @@ async function reserve(db, data, source, admissionSecret) {
     epochState(db, day),
     ...cleanupExpiredAdmissions(db, day, receiptId),
   ]);
-  const run = results[6].results[0];
+  const run = results[readIndex].results[0];
   if (run) {
     if (run.input_digest !== digest) throw new StoreError("idempotency_conflict", 409);
     return { status: run.id === runId ? "pending" : "replay", run,
-      receipt: results[7].results[0] || null };
+      receipt: results[readIndex + 1].results[0] || null };
   }
-  if (epochUnavailable(results[9].results[0], fingerprint)) {
+  if (epochUnavailable(results[readIndex + 3].results[0], fingerprint)) {
     throw new StoreError("admission_unavailable", 503);
   }
-  const limits = results[8].results[0];
+  const limits = results[readIndex + 2].results[0];
   if (!limits.owned) throw new StoreError("not_found", 404);
   if (limits.message_count !== data.expected_message_count) throw new StoreError("context_changed", 409);
   if (limits.unresolved) throw new StoreError("conversation_unresolved", 409);
@@ -484,7 +515,7 @@ export default {
       }
       if (data?.op === "check") {
         fields(data, ["op"]);
-        return json(await check(env.DB, env.ADMISSION_SECRET));
+        return json(await check(env.DB, env.ADMISSION_SECRET, modelBindingEnforced(env)));
       }
       string(data?.owner, 64, OWNER);
       let result;
@@ -492,7 +523,8 @@ export default {
         case "list": result = await list(env.DB, data); break;
         case "create": result = await create(env.DB, data, revision(env), env.ADMISSION_SECRET); break;
         case "get": result = await get(env.DB, data); break;
-        case "reserve": result = await reserve(env.DB, data, revision(env), env.ADMISSION_SECRET); break;
+        case "reserve": result = await reserve(env.DB, data, revision(env), env.ADMISSION_SECRET,
+          modelBindingEnforced(env)); break;
         case "complete":
         case "uncertain": result = await finish(env.DB, data, revision(env)); break;
         case "purge": result = await purge(env.DB, data, revision(env)); break;

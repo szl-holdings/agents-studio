@@ -42,12 +42,32 @@ TCP_SEGMENT_CEILING = 536
 HANDSHAKE_WINDOW_BYTES = 536
 RESPONSE_WINDOW_BYTES = 65535
 UUID_PATTERN = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+MODEL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9][A-Za-z0-9._-]*)?$")
 LIMITS = {"prompt_characters": 2000, "output_tokens": MAX_OUTPUT_TOKENS,
           "daily_user_runs": 20, "daily_global_runs": 200, "conversations": 100}
 DIAGNOSTIC_WINDOW_SECONDS = 60
 DIAGNOSTIC_GLOBAL_LIMIT = 30
 DIAGNOSTIC_OWNER_LIMIT = 6
 DIAGNOSTIC_INFLIGHT_LIMIT = 2
+
+
+def model_binding(engine):
+    try:
+        identity = engine.identity()
+    except Exception:
+        raise RuntimeError("model_unavailable") from None
+    if not isinstance(identity, dict) or identity.get("weights_verified") is not True:
+        raise RuntimeError("model_unavailable")
+    model_id = identity.get("model")
+    revision = identity.get("revision")
+    weights_sha256 = identity.get("weights_sha256")
+    if (not isinstance(model_id, str) or len(model_id) > 200
+            or not MODEL_ID_PATTERN.fullmatch(model_id)
+            or not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{40}", revision)
+            or not isinstance(weights_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", weights_sha256)):
+        raise RuntimeError("model_unavailable")
+    return {"id": model_id, "revision": revision, "weights_sha256": weights_sha256}
 
 
 class DiagnosticBudget:
@@ -787,7 +807,9 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
             admission_epoch_version = result.get("admission_epoch_version")
             matched = (result.get("status") == "available" and type(schema_version) is int
                        and schema_version == 1 and type(admission_epoch_version) is int
-                       and admission_epoch_version == 1 and result.get("receipt_minted") is False)
+                        and admission_epoch_version == 1
+                        and result.get("model_binding_enforced") is True
+                        and result.get("receipt_minted") is False)
             if matched:
                 return {"ok": True, "failure": None}
             return {"ok": False, "failure": "schema_mismatch"}
@@ -1014,10 +1036,11 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
             raise ApiError("store_unavailable", 503) from None
         try:
             with engine.admission(history + [{"role": "user", "content": prompt}]) as generate:
+                binding = model_binding(engine)
                 reservation = store.call("reserve", owner=user["owner"], conversation_id=conversation_id,
                                          idempotency_key=key, prompt=prompt,
                                          max_output_tokens=MAX_OUTPUT_TOKENS,
-                                         expected_message_count=len(messages))
+                                         expected_message_count=len(messages), model_binding=binding)
                 saved = reservation.get("run")
                 if (not isinstance(saved, dict) or saved.get("owner") != user["owner"]
                         or saved.get("conversation_id") != conversation_id
@@ -1034,6 +1057,11 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
                         raise ApiError("store_unavailable", 503)
                     return jsonify(status=saved["state"], run=saved, replay=True)
                 if reservation.get("status") != "pending" or saved.get("state") != "pending":
+                    raise ApiError("store_unavailable", 503)
+                if (saved.get("model_id") != binding["id"]
+                        or saved.get("model_revision") != binding["revision"]
+                        or saved.get("model_weights_sha256") != binding["weights_sha256"]
+                        or saved.get("model_binding_evidence") != "DECLARED"):
                     raise ApiError("store_unavailable", 503)
                 try:
                     generated = generate()
