@@ -9,6 +9,7 @@ COPY --chown=studio:studio app.py engine.py /app/
 COPY --chown=studio:studio static /app/static
 COPY --chown=studio:studio source.json /app/source.json
 USER studio
-ENV HOME=/home/studio HF_HOME=/home/studio/.cache/huggingface MODEL_ENABLED=1
+ENV HOME=/home/studio HF_HOME=/home/studio/.cache/huggingface MODEL_ENABLED=1 \
+    HF_HUB_DISABLE_PROGRESS_BARS=1 PYTHONIOENCODING=UTF-8 LANG=C.UTF-8 LC_ALL=C.UTF-8
 EXPOSE 7860
 CMD ["gunicorn", "--bind", "0.0.0.0:7860", "--workers", "1", "--threads", "4", "--timeout", "120", "app:create_app()"]
