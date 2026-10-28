@@ -6,6 +6,22 @@ let current = null;
 let snapshot = null;
 let busy = false;
 let sequence = 0;
+let sessionGeneration = 0;
+let reloadSequence = 0;
+
+function invalidateSessionReads() { sessionGeneration++; sequence++; reloadSequence++; }
+function clearSignedOutView(anonymousSession = null) {
+  invalidateSessionReads();
+  session = anonymousSession;
+  conversations = []; current = null; snapshot = null;
+  $("search").value = "";
+  renderList();
+  $("messages").querySelectorAll(".message,.run-state").forEach((node) => node.remove());
+  $("welcome").hidden = false;
+  $("title").textContent = "Agents Studio";
+  $("prompt").value = ""; $("counter").textContent = "0 / 2,000";
+  controls();
+}
 
 function icons() { window.lucide?.createIcons(); }
 function notice(message = "") { $("notice").textContent = message; $("notice").hidden = !message; }
@@ -115,29 +131,33 @@ function renderConversation(data) {
   controls();
 }
 async function openConversation(id) {
+  const generation = sessionGeneration;
   const request = ++sequence;
   const data = await api(`/api/conversations/${encodeURIComponent(id)}`);
-  if (request !== sequence) return;
+  if (request !== sequence || generation !== sessionGeneration) return;
   current = id;
   renderConversation(data);
   renderList();
   document.body.classList.remove("menu-open");
 }
 async function reload() {
-  session = await api("/api/session");
+  const generation = sessionGeneration;
+  const request = ++reloadSequence;
+  const navigation = sequence;
+  const refreshedSession = await api("/api/session");
+  if (generation !== sessionGeneration || request !== reloadSequence) return;
+  session = refreshedSession;
   controls();
   notice(session.store_failure ? storageMessage(session.store_failure)
     : session.store_check_deferred ? "Availability check deferred. Requests are verified when sent." : "");
   if (session.user) {
     const data = await api("/api/conversations");
+    if (generation !== sessionGeneration || request !== reloadSequence) return;
     conversations = data.conversations;
     renderList();
-    if (current) await openConversation(current);
+    if (current && navigation === sequence) await openConversation(current);
   } else {
-    conversations = []; current = null; snapshot = null; renderList();
-    $("messages").querySelectorAll(".message,.run-state").forEach((node) => node.remove());
-    $("welcome").hidden = false;
-    $("title").textContent = "Agents Studio";
+    clearSignedOutView(refreshedSession);
   }
 }
 async function createConversation(title = "New conversation") {
@@ -166,15 +186,19 @@ $("login").onclick = () => {
   form.append(csrf); document.body.append(form); form.submit();
 };
 $("logout").onclick = async () => {
-  try { await api("/auth/logout", {method: "POST", body: "{}"}); await reload(); notice(); }
-  catch (error) { notice(friendly(error)); }
+  invalidateSessionReads();
+  try {
+    await api("/auth/logout", {method: "POST", body: "{}"});
+    clearSignedOutView();
+    await reload(); notice();
+  } catch (error) { notice(friendly(error)); }
 };
 $("delete-account").onclick = async () => {
   if (busy || !window.confirm("Delete all your saved conversations and runs? This cannot be undone.")) return;
-  busy = true; controls(); notice();
+  busy = true; invalidateSessionReads(); controls(); notice();
   try {
     await api("/api/account", {method: "DELETE", body: "{}"});
-    sequence++;
+    clearSignedOutView();
     await reload();
     notice("Your saved data was deleted and you have been signed out.");
     document.body.classList.remove("menu-open");
