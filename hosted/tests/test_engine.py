@@ -1,5 +1,11 @@
+import hashlib
+import sys
+import tempfile
 import threading
+import types
 import unittest
+from pathlib import Path
+from unittest import mock
 
 from engine import Engine, MODEL_ID, MODEL_REVISION, WEIGHTS_SHA256
 
@@ -47,6 +53,36 @@ class EngineTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "model_busy"):
             engine.generate([{"role": "user", "content": "hello"}])
         engine._lock.release()
+
+    def test_load_clears_unused_sampling_defaults_for_greedy_decoding(self):
+        # Stub modules stand in for torch, huggingface_hub and transformers: no download, no weights.
+        generation = types.SimpleNamespace(do_sample=True, temperature=0.7, top_p=0.8, top_k=20,
+                                           repetition_penalty=1.1)
+        model = mock.Mock(generation_config=generation)
+        model.to.return_value = model
+        model.eval.return_value = model
+        threads = []
+        with tempfile.TemporaryDirectory() as path:
+            Path(path, "model.safetensors").write_bytes(b"stub weights")
+            stubs = {
+                "torch": types.SimpleNamespace(set_num_threads=threads.append, float32="float32"),
+                "huggingface_hub": types.SimpleNamespace(snapshot_download=lambda *args, **kwargs: path),
+                "transformers": types.SimpleNamespace(
+                    AutoTokenizer=types.SimpleNamespace(from_pretrained=lambda *args, **kwargs: object()),
+                    AutoModelForCausalLM=types.SimpleNamespace(from_pretrained=lambda *args, **kwargs: model)),
+            }
+            digest = mock.Mock(**{"hexdigest.return_value": WEIGHTS_SHA256})
+            with mock.patch.dict(sys.modules, stubs), \
+                    mock.patch.object(hashlib, "file_digest", return_value=digest):
+                engine = Engine(start=False)
+                engine._load()
+        self.assertIsNone(engine.failure)
+        self.assertTrue(engine.ready)
+        self.assertEqual(threads, [2])
+        model.to.assert_called_once_with("cpu")
+        self.assertEqual((generation.temperature, generation.top_p, generation.top_k), (None, None, None))
+        # Only the three sampling fields change; generate() still passes do_sample=False itself.
+        self.assertEqual((generation.do_sample, generation.repetition_penalty), (True, 1.1))
 
 
 if __name__ == "__main__":
