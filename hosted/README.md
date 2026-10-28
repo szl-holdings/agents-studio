@@ -98,6 +98,28 @@ storage is reported as `UNKNOWN`, no store call is made, and `/readyz` returns
 replicas have separate budgets, and other authenticated store operations are
 not covered.
 
+## Owner end-to-end witness
+
+`tools/verify_agents_studio.py` is run by the owner on their own Windows PC,
+never in CI. It needs Python Playwright and the installed Microsoft Edge:
+
+```powershell
+py -3 -m pip install playwright
+py -3 hosted\tools\verify_agents_studio.py
+```
+
+It opens a separate Edge window with its own profile under
+`%LOCALAPPDATA%\szl-agents-studio-witness`, not the everyday browser profile.
+The owner signs in to Hugging Face and authorizes the app in that window; the
+other steps are automatic. It checks signed-in readiness (`/api/session` and
+`/readyz`), the pinned model identity, one bounded generation, the run's model
+binding, and persistence after a full page reload. Erasure of the account's
+Agents Studio data runs only after the owner types `ERASE`; Enter skips it.
+It prints and saves statuses only, never tokens, cookies or CSRF values. Its
+receipt, `tools/agents-studio-witness-<UTC time>.json`, is written next to the
+script and is git-ignored. A PASS is one owner-attested run, not independent
+attestation, a model-quality evaluation or a release.
+
 ## Release
 
 1. Review, sign and push the smallest source change through the ordinary PR path.

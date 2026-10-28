@@ -15,6 +15,7 @@ __pycache__/
 .venv/
 .venv-hosted/
 hosted/source.json
+hosted/tools/agents-studio-witness-*.json
 .pytest_cache/
 outputs/
 LIVE_RUN.md

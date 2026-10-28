@@ -46,6 +46,10 @@ class Engine:
                 path, local_files_only=True, trust_remote_code=False,
                 use_safetensors=True, dtype=torch.float32,
             ).to("cpu").eval()
+            # Decoding is greedy (do_sample=False). The checkpoint's sampling defaults are unused
+            # there and make transformers warn that they "may be ignored"; clear only those three.
+            generation = self._model.generation_config
+            generation.temperature = generation.top_p = generation.top_k = None
             self.ready = True
         except Exception:
             self.failure = "model_load_failed"
