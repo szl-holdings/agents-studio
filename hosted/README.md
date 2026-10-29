@@ -69,6 +69,20 @@ or responses.
 Use the current `cf` CLI and official configuration schema for deployment;
 this repository does not introduce a second automatic publisher.
 
+The optional `GET /v1/metrics` Worker endpoint exposes only existing global,
+owner-free daily run and conversation admission counts for the preceding 30
+completed UTC days. Missing days are omitted rather than backfilled. It
+does not expose account identifiers, conversation content, latency, or errors.
+An independently generated `METRICS_SECRET` is required and must differ from
+the store and admission secrets; leave it unset to keep the endpoint disabled.
+The endpoint only reads D1 and does not mint a receipt. Its `DECLARED` data are
+not a model or authorization attestation. Configure a narrowly scoped exporter,
+enforced request and cost limits, Snowflake service identity and grants,
+retention, and appropriate public privacy disclosure before deploying or using
+this endpoint to transfer metrics. The Worker retains its full D1 binding; the
+separate secret limits only access through this endpoint, not D1 permissions.
+This source change alone neither configures nor verifies a Snowflake connection.
+
 `MODEL_ENABLED=1` starts the pinned CPU model loader. Otherwise generation is
 UNAVAILABLE, never simulated. CPU Basic can sleep. The 45-second generation
 timeout is best effort; it is not a hard execution deadline or SLA.
