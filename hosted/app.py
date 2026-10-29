@@ -70,6 +70,16 @@ def model_binding(engine):
     return {"id": model_id, "revision": revision, "weights_sha256": weights_sha256}
 
 
+def model_ready(engine):
+    if not engine.ready:
+        return False
+    try:
+        model_binding(engine)
+    except RuntimeError:
+        return False
+    return True
+
+
 class DiagnosticBudget:
     def __init__(self, clock=time.monotonic):
         self._clock = clock
@@ -886,7 +896,7 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
     def ready():
         user = current_user()
         diagnostic = store_diagnostic(user["owner"]) if user else {"ok": False, "failure": None}
-        result = {"auth": auth_ready, "store": diagnostic["ok"], "model": bool(engine.ready)}
+        result = {"auth": auth_ready, "store": diagnostic["ok"], "model": model_ready(engine)}
         body = {"ready": result, "receipt_minted": False}
         if not user or diagnostic.get("deferred"):
             body["store_evidence"] = "UNKNOWN"
@@ -906,7 +916,7 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
         body = {"user": {"name": user["name"]} if user else None,
                 "csrf": session["csrf"], "limits": LIMITS,
                 "ready": {"auth": auth_ready, "store": diagnostic["ok"],
-                          "model": bool(engine.ready)}}
+                          "model": model_ready(engine)}}
         if not user or diagnostic.get("deferred"):
             body["store_evidence"] = "UNKNOWN"
         if diagnostic.get("deferred"):
