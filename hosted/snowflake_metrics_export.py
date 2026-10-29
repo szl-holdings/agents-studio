@@ -90,15 +90,22 @@ def parse_metrics(data, today=None):
     return days
 
 
-def fetch_metrics(secret, *, opener=None, today=None):
+def _metrics_url(environ):
+    value = environ.get("STUDIO_METRICS_URL", METRICS_URL)
+    if not isinstance(value, str) or not value.startswith("https://") or "\n" in value or "\r" in value:
+        raise ExportError("metrics_configuration_invalid")
+    return value
+
+
+def fetch_metrics(secret, *, opener=None, today=None, url=METRICS_URL):
     if not isinstance(secret, str) or len(secret) < 32 or "\n" in secret or "\r" in secret:
         raise ExportError("metrics_configuration_invalid")
-    request = urllib.request.Request(METRICS_URL, headers={"Authorization": "Bearer " + secret,
+    request = urllib.request.Request(url, headers={"Authorization": "Bearer " + secret,
                                                            "Accept": "application/json"})
     opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     try:
         with opener.open(request, timeout=15) as response:
-            if response.status != 200 or response.geturl() != METRICS_URL:
+            if response.status != 200 or response.geturl() != url:
                 raise ExportError("metrics_unavailable")
             raw = response.read(MAX_RESPONSE_BYTES + 1)
         if len(raw) > MAX_RESPONSE_BYTES:
@@ -191,7 +198,8 @@ def export_once(environ, *, opener=None, connect=None, today=None):
     # Validate every local input before the first remote request or query.
     config = snowflake_config(environ)
     source_revision = _source_revision(environ)
-    days = fetch_metrics(environ.get("STUDIO_METRICS_SECRET", ""), opener=opener, today=today)
+    days = fetch_metrics(environ.get("STUDIO_METRICS_SECRET", ""), opener=opener, today=today,
+                         url=_metrics_url(environ))
     if not days:
         return 0
     rows = _with_identity(days, source_revision)

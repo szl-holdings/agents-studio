@@ -1,0 +1,44 @@
+name: Aggregate metrics export
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: szl-snowflake-metrics-writer
+  cancel-in-progress: false
+
+jobs:
+  export:
+    # Keep the writer disabled until the Worker route, METRICS_SECRET, and
+    # GitHub secret custody have each been independently verified.
+    if: ${{ vars.SZL_METRICS_EXPORT_ENABLED == '1' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12.10'
+      - name: Install the isolated exporter dependency
+        run: python -m pip install --disable-pip-version-check -r hosted/requirements-snowflake.txt
+      - name: Export one UTC aggregate window
+        env:
+          STUDIO_METRICS_SECRET: ${{ secrets.STUDIO_METRICS_SECRET }}
+          STUDIO_METRICS_URL: ${{ vars.STUDIO_METRICS_URL }}
+          STUDIO_SNOWFLAKE_ACCOUNT: ${{ vars.STUDIO_SNOWFLAKE_ACCOUNT }}
+          STUDIO_SNOWFLAKE_USER: SZL_STUDIO_METRICS_SERVICE
+          STUDIO_SNOWFLAKE_ROLE: SZL_STUDIO_METRICS_WRITER
+          STUDIO_SNOWFLAKE_WAREHOUSE: SZL_STUDIO_METRICS_WH
+          STUDIO_SNOWFLAKE_DATABASE: SZL_STUDIO_METRICS
+          STUDIO_SNOWFLAKE_SCHEMA: TELEMETRY
+          STUDIO_SNOWFLAKE_PRIVATE_KEY_B64: ${{ secrets.STUDIO_SNOWFLAKE_PRIVATE_KEY_B64 }}
+          STUDIO_SNOWFLAKE_PRIVATE_KEY_PASSWORD: ${{ secrets.STUDIO_SNOWFLAKE_PRIVATE_KEY_PASSWORD }}
+          STUDIO_SNOWFLAKE_SOURCE_REVISION: ${{ github.sha }}
+        run: python hosted/snowflake_operator.py
