@@ -13,6 +13,7 @@ const SECRET = "synthetic-local-test-secret-not-for-deployment";
 const ADMISSION_SECRET = "synthetic-independent-admission-key-for-tests";
 const ROTATED_SECRET = "synthetic-rotated-store-secret-for-tests";
 const ROTATED_ADMISSION_SECRET = "synthetic-rotated-admission-secret-for-tests";
+const METRICS_SECRET = "synthetic-independent-metrics-secret-for-tests";
 
 // The adapter models the D1 binding API and executes every guard against SQLite.
 // It does not claim to test Cloudflare's deployed runtime or network semantics.
@@ -126,6 +127,53 @@ test("health is a read-only declaration, not database readiness", async (t) => {
   assert.equal(env.DB.calls.length, 0);
   assert.equal(env.DB.count("receipts"), 0);
   assert.equal(response.headers.get("cache-control"), "no-store");
+});
+
+test("metrics expose only recent owner-free admission counters under an independent credential", async (t) => {
+  const env = { ...environment(t), METRICS_SECRET };
+  const now = new Date();
+  const utcDay = (offset) => new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(),
+    now.getUTCDate() + offset)).toISOString().slice(0, 10);
+  const firstDay = utcDay(-30), lastDay = utcDay(-1);
+  env.DB.sqlite.prepare("INSERT INTO conversation_admissions VALUES (?, 2)").run(lastDay);
+  env.DB.sqlite.prepare("INSERT INTO run_admissions VALUES (?, 3)").run(lastDay);
+  env.DB.sqlite.prepare("INSERT INTO run_admissions VALUES (?, 4)").run(firstDay);
+  for (const outside of [utcDay(-31), utcDay(0), utcDay(1)]) {
+    env.DB.sqlite.prepare("INSERT INTO run_admissions VALUES (?, 8)").run(outside);
+  }
+  seedConversation(env);
+  const req = (secret, suffix = "", method = "GET") => new Request(
+    `https://store.example/v1/metrics${suffix}`,
+    { method, headers: { authorization: `Bearer ${secret}` } });
+  const noAuth = await worker.fetch(req(SECRET), env);
+  assert.equal(noAuth.status, 401);
+  assert.equal(env.DB.calls.length, 0);
+  const wrongScope = await call(env, { op: "check" },
+    { headers: { authorization: `Bearer ${METRICS_SECRET}` } });
+  assert.equal(wrongScope.status, 401);
+  assert.equal(env.DB.calls.length, 0);
+  const response = await worker.fetch(req(METRICS_SECRET), env);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { evidence_class: "DECLARED", receipt_minted: false,
+    days: [{ day: firstDay, conversations_admitted: 0, runs_admitted: 4 },
+      { day: lastDay, conversations_admitted: 2, runs_admitted: 3 }] });
+  assert.ok(env.DB.calls.every(({ sql }) => sql.trim().startsWith("SELECT")));
+  assert.equal(env.DB.count("receipts"), 0);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  const firstRead = env.DB.count("run_admissions");
+  const repeated = await worker.fetch(req(METRICS_SECRET), env);
+  assert.equal(repeated.status, 200);
+  assert.equal(env.DB.count("run_admissions"), firstRead);
+  assert.equal(env.DB.count("receipts"), 0);
+  assert.equal((await worker.fetch(req(METRICS_SECRET, "?extra=1"), env)).status, 404);
+  assert.equal((await worker.fetch(req(METRICS_SECRET, "", "POST"), env)).status, 405);
+  for (const bad of [undefined, "short", SECRET, ADMISSION_SECRET]) {
+    assert.equal((await worker.fetch(req(METRICS_SECRET), { ...env, METRICS_SECRET: bad })).status, 503);
+  }
+  env.DB.failOn = "SUM(conversations)";
+  const unavailable = await worker.fetch(req(METRICS_SECRET), env);
+  assert.equal(unavailable.status, 503);
+  assert.deepEqual(await unavailable.json(), { error: "store_unavailable" });
 });
 
 test("authenticated readiness checks schema without creating state", async (t) => {

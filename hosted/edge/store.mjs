@@ -68,6 +68,11 @@ function configuredAdmissionSecret(env) {
   return validSecret(env.ADMISSION_SECRET) && env.ADMISSION_SECRET !== env.STORE_SECRET;
 }
 
+function configuredMetricsSecret(env) {
+  return validSecret(env.METRICS_SECRET) && env.METRICS_SECRET !== env.STORE_SECRET &&
+    env.METRICS_SECRET !== env.ADMISSION_SECRET;
+}
+
 function modelBindingEnforced(env) {
   return env.REQUIRE_MODEL_BINDING === "1";
 }
@@ -236,6 +241,26 @@ async function check(db, admissionSecret, bindingEnforced) {
   }
   return { status: "available", schema_version: 1, admission_epoch_version: 1,
     model_binding_enforced: bindingEnforced, receipt_minted: false };
+}
+
+// An owner-free, bounded source for an operator-managed metrics exporter.
+// A missing day is not backfilled: this endpoint describes retained counters only.
+async function admissionMetrics(db) {
+  const today = new Date();
+  const end = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(),
+    today.getUTCDate() - 1)).toISOString().slice(0, 10);
+  const start = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(),
+    today.getUTCDate() - 30)).toISOString().slice(0, 10);
+  const [result] = await batch(db, [prepared(db, `SELECT day,
+    SUM(conversations) AS conversations_admitted, SUM(runs) AS runs_admitted
+    FROM (
+      SELECT day, admitted AS conversations, 0 AS runs FROM conversation_admissions
+        WHERE day >= ? AND day <= ?
+      UNION ALL
+      SELECT day, 0 AS conversations, admitted AS runs FROM run_admissions
+        WHERE day >= ? AND day <= ?
+    ) GROUP BY day ORDER BY day`, [start, end, start, end])]);
+  return { evidence_class: "DECLARED", receipt_minted: false, days: result.results };
 }
 
 async function create(db, data, source, admissionSecret) {
@@ -504,6 +529,12 @@ export default {
           database_bound: Boolean(env.DB), authentication_configured: configuredSecret(env),
           admission_configured: configuredAdmissionSecret(env),
           storage_readiness: "UNKNOWN", receipt_minted: false });
+      }
+      if (url.pathname === "/v1/metrics" && !url.search) {
+        if (request.method !== "GET") throw new StoreError("method_not_allowed", 405);
+        if (!configuredMetricsSecret(env) || !env.DB) throw new StoreError("store_unavailable", 503);
+        if (!await authorized(request, env.METRICS_SECRET)) throw new StoreError("unauthorized", 401);
+        return json(await admissionMetrics(env.DB));
       }
       if (url.pathname !== "/v1/store" || url.search) throw new StoreError("not_found", 404);
       if (request.method !== "POST") throw new StoreError("method_not_allowed", 405);
