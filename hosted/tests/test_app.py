@@ -294,6 +294,64 @@ class HostedAppTests(unittest.TestCase):
         self.assertEqual(self.engine.active, 0)
         self.assertEqual(self.engine.generations, 0)
 
+    def test_store_reservation_failure_releases_admission_without_dispatch(self):
+        self.sign_in()
+        self.store.unavailable.add("reserve")
+        original_call = self.store.call
+
+        def observed_call(op, **data):
+            if op == "reserve":
+                self.assertEqual(self.engine.active, 1)
+                self.assertEqual(len(self.engine.admissions), 1)
+            return original_call(op, **data)
+
+        with mock.patch.object(self.store, "call", side_effect=observed_call):
+            response = self.run_request()
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json["error"], "store_unavailable")
+        self.assertEqual([op for op, _ in self.store.calls].count("reserve"), 1)
+        self.assertEqual(len(self.engine.admissions), 1)
+        self.assertEqual(self.engine.active, 0)
+        self.assertEqual(self.engine.generations, 0)
+
+    def test_racing_store_replay_releases_admission_without_dispatch(self):
+        test = self
+
+        class ReplayAfterRead(FakeStore):
+            def call(self, op, **data):
+                if op != "reserve":
+                    return super().call(op, **data)
+                self.calls.append((op, copy.deepcopy(data)))
+                test.assertEqual(test.engine.active, 1)
+                test.assertEqual(len(test.engine.admissions), 1)
+                test.assertEqual(self.runs, [])
+                # Model a competing request that won after our initial read.
+                winner = {"id": str(uuid.uuid4()), "owner": data["owner"],
+                          "conversation_id": data["conversation_id"],
+                          "idempotency_key": data["idempotency_key"], "prompt": data["prompt"],
+                          "max_output_tokens": data["max_output_tokens"], "state": "pending",
+                          "model_id": data["model_binding"]["id"],
+                          "model_revision": data["model_binding"]["revision"],
+                          "model_weights_sha256": data["model_binding"]["weights_sha256"],
+                          "model_binding_evidence": "DECLARED"}
+                self.runs.append(winner)
+                self.messages.append({"role": "user", "content": data["prompt"]})
+                return {"status": "replay", "run": copy.deepcopy(winner)}
+
+        self.rebuild(ReplayAfterRead())
+        self.sign_in()
+        response = self.run_request()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json["replay"])
+        self.assertEqual(response.json["status"], "pending")
+        self.assertEqual([op for op, _ in self.store.calls].count("reserve"), 1)
+        self.assertEqual(len(self.store.runs), 1)
+        self.assertEqual(len(self.store.messages), 1)
+        self.assertEqual(response.json["run"]["id"], self.store.runs[0]["id"])
+        self.assertEqual(len(self.engine.admissions), 1)
+        self.assertEqual(self.engine.active, 0)
+        self.assertEqual(self.engine.generations, 0)
+
     def test_new_run_binds_model_before_dispatch(self):
         self.sign_in()
         response = self.run_request()
