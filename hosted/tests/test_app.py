@@ -13,7 +13,7 @@ from urllib3.util import connection as urllib3_connection
 
 from app import (ApiError, DiagnosticBudget, HANDSHAKE_WINDOW_BYTES, ISSUER, RESPONSE_WINDOW_BYTES, Store,
                  StoreFailure, TCP_SEGMENT_CEILING, create_app, decode_store_response,
-                 owner_key, valid_store_url)
+                 model_ready, owner_key, valid_store_url)
 from engine import Engine, MAX_INPUT_TOKENS
 
 
@@ -528,6 +528,25 @@ class HostedAppTests(unittest.TestCase):
         self.engine.weights_verified = True
         self.assertEqual(self.client.get("/readyz", **self.base).status_code, 200)
         self.assertTrue(self.client.get("/api/session", **self.base).json["ready"]["model"])
+
+    def test_scoped_artifact_identity_cannot_be_silently_reduced(self):
+        self.sign_in()
+        baseline = self.engine.identity()
+        for scope in ({"artifact_custody": "FRESH_HASHED_CACHE_BYTES_ONLY",
+                       "loaded_gpu_weights_verified": False},
+                      {"artifact_custody": "unknown"},
+                      {"loaded_gpu_weights_verified": False},
+                      {"loaded_gpu_weights_verified": True}):
+            with self.subTest(scope=scope), mock.patch.object(self.engine, "identity", return_value={**baseline, **scope}):
+                ready = self.client.get("/readyz", **self.base)
+                self.assertEqual(ready.status_code, 503)
+                self.assertFalse(ready.json["ready"]["model"])
+                self.assertFalse(self.client.get("/api/session", **self.base).json["ready"]["model"])
+                self.assertEqual(self.run_request().status_code, 503)
+        self.assertNotIn("reserve", [op for op, _ in self.store.calls])
+        self.assertEqual(self.engine.generations, 0)
+        self.assertEqual(self.engine.active, 0)
+        self.assertTrue(model_ready(self.engine))
 
     def test_readiness_rejects_invalid_identity_and_identity_errors(self):
         self.sign_in()

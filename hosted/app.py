@@ -58,6 +58,11 @@ def model_binding(engine):
         raise RuntimeError("model_unavailable") from None
     if not isinstance(identity, dict) or identity.get("weights_verified") is not True:
         raise RuntimeError("model_unavailable")
+    # The current store binding cannot preserve scoped artifact or loaded-GPU
+    # evidence. Refuse such identities until the full scope can be retained;
+    # a cache-byte hash must not become an unqualified runtime claim.
+    if "artifact_custody" in identity or "loaded_gpu_weights_verified" in identity:
+        raise RuntimeError("model_unavailable")
     model_id = identity.get("model")
     revision = identity.get("revision")
     weights_sha256 = identity.get("weights_sha256")
