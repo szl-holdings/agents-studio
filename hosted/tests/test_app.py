@@ -456,6 +456,39 @@ class HostedAppTests(unittest.TestCase):
         self.assertNotIn("store_failure", self.client.get("/api/session", **self.base).json)
         self.assertEqual([op for op, _ in self.store.calls].count("check"), 3)
 
+    def test_unverified_model_is_not_ready_and_recovers(self):
+        self.sign_in()
+        self.engine.weights_verified = False
+        ready = self.client.get("/readyz", **self.base)
+        info = self.client.get("/api/session", **self.base)
+        self.assertEqual(ready.status_code, 503)
+        self.assertFalse(ready.json["ready"]["model"])
+        self.assertFalse(info.json["ready"]["model"])
+        self.assertEqual(self.engine.generations, 0)
+        self.assertNotIn("reserve", [op for op, _ in self.store.calls])
+
+        self.engine.weights_verified = True
+        self.assertEqual(self.client.get("/readyz", **self.base).status_code, 200)
+        self.assertTrue(self.client.get("/api/session", **self.base).json["ready"]["model"])
+
+    def test_readiness_rejects_invalid_identity_and_identity_errors(self):
+        self.sign_in()
+        for field, value in (("model_id", "bad model"),
+                             ("model_revision", "bad"),
+                             ("model_weights_sha256", "bad")):
+            with self.subTest(field=field):
+                old = getattr(self.engine, field)
+                setattr(self.engine, field, value)
+                response = self.client.get("/readyz", **self.base)
+                self.assertEqual(response.status_code, 503)
+                self.assertFalse(response.json["ready"]["model"])
+                setattr(self.engine, field, old)
+        with mock.patch.object(self.engine, "identity", side_effect=RuntimeError("synthetic")):
+            response = self.client.get("/api/session", **self.base)
+            self.assertEqual(response.status_code, 200)
+            self.assertFalse(response.json["ready"]["model"])
+        self.assertEqual(self.client.get("/readyz", **self.base).status_code, 200)
+
     def test_anonymous_diagnostics_do_not_probe_store(self):
         self.store.unavailable.add("check")
         first = self.client.get("/api/session", **self.base)
