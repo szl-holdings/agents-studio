@@ -139,7 +139,9 @@ def snowflake_config(environ):
                                       "CLIENT_SESSION_KEEP_ALIVE": False})
     passphrase = environ.get("STUDIO_SNOWFLAKE_PRIVATE_KEY_PASSWORD")
     if passphrase:
-        values["private_key_password"] = passphrase
+        # snowflake.connector.connect accepts private_key_file_pwd, not
+        # private_key_password. The wrong name fails login as an uncertain write.
+        values["private_key_file_pwd"] = passphrase
     return values
 
 

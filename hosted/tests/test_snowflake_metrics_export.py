@@ -120,6 +120,12 @@ class ExportTests(unittest.TestCase):
         with self.assertRaises(ExportError):
             snowflake_config({**environment(), "STUDIO_SNOWFLAKE_PRIVATE_KEY_FILE": "relative.key"})
 
+    def test_encrypted_key_uses_the_connector_passphrase_field(self):
+        config = snowflake_config({**environment(),
+                                   "STUDIO_SNOWFLAKE_PRIVATE_KEY_PASSWORD": "synthetic-passphrase"})
+        self.assertEqual(config["private_key_file_pwd"], "synthetic-passphrase")
+        self.assertNotIn("private_key_password", config)
+
     def test_http_redirect_and_oversize_fail_closed(self):
         opener = self.opener()
         opener.open.return_value.geturl = lambda: "https://other.example/metrics"

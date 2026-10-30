@@ -45,8 +45,9 @@ def run() -> int:
         print("snowflake_connector_unavailable")
         return 1
 
-    key_path, directory = _private_key_file()
+    directory = None
     try:
+        key_path, directory = _private_key_file()
         environ = dict(os.environ)
         environ["STUDIO_SNOWFLAKE_PRIVATE_KEY_FILE"] = key_path
         environ.setdefault("STUDIO_SNOWFLAKE_USER", "SZL_STUDIO_METRICS_SERVICE")
@@ -57,7 +58,8 @@ def run() -> int:
         print(str(error))
         return 1
     finally:
-        directory.cleanup()
+        if directory is not None:
+            directory.cleanup()
     print(f"aggregate_days_exported={count}")
     return 0
 
