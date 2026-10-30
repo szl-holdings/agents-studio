@@ -100,8 +100,12 @@ def _metrics_url(environ):
 def fetch_metrics(secret, *, opener=None, today=None, url=METRICS_URL):
     if not isinstance(secret, str) or len(secret) < 32 or "\n" in secret or "\r" in secret:
         raise ExportError("metrics_configuration_invalid")
-    request = urllib.request.Request(url, headers={"Authorization": "Bearer " + secret,
-                                                           "Accept": "application/json"})
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": "Bearer " + secret,
+                 "Accept": "application/json",
+                 "User-Agent": "SZL-Agents-Studio-Metrics/1"},
+    )
     opener = opener or urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     try:
         with opener.open(request, timeout=15) as response:
