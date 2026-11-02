@@ -9,6 +9,7 @@ provisioned separately. No conversation content is accepted.
 
 import datetime as dt
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -150,7 +151,7 @@ def fetch_metrics(secret, *, opener=None, today=None, url=METRICS_URL):
         data = json.loads(raw)
     except ExportError:
         raise
-    except (OSError, ValueError, urllib.error.URLError):
+    except (OSError, ValueError, urllib.error.URLError, http.client.HTTPException):
         raise ExportError("metrics_unavailable") from None
     return parse_metrics(data, today)
 
