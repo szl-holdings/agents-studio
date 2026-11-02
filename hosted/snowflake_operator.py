@@ -1,9 +1,10 @@
 """Fail-closed entrypoint for the unqualified Snowflake metrics transport.
 
 The exporter accepts an injected connector only for offline synthetic tests.
-The production connector's retries, request identity and durable uncertainty
-custody have not been qualified. A schedule or configured credentials cannot
-supply that evidence. See SNOWFLAKE_RECONCILIATION.md before any future adapter.
+The durable D1 hold and read-only reconciliation source have not been deployed
+or qualified with the production connector. A schedule or configured
+credentials cannot supply that evidence. See SNOWFLAKE_RECONCILIATION.md before
+any future adapter.
 """
 
 

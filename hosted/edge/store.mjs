@@ -7,6 +7,10 @@ const IDENTIFIER = /^[A-Za-z0-9._:-]+$/;
 const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)?$/;
 const REVISION = /^[a-f0-9]{40}$/;
 const SHA256 = /^[a-f0-9]{64}$/;
+const UUID_V4 = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+const SAFE_IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const ACCOUNT_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const METRICS_SCHEMA_VERSION = "szl.metrics.daily-admissions/v2";
 const HEADERS = {
   "content-type": "application/json; charset=utf-8",
   "cache-control": "no-store",
@@ -71,6 +75,12 @@ function configuredAdmissionSecret(env) {
 function configuredMetricsSecret(env) {
   return validSecret(env.METRICS_SECRET) && env.METRICS_SECRET !== env.STORE_SECRET &&
     env.METRICS_SECRET !== env.ADMISSION_SECRET;
+}
+
+function configuredDispatchSecret(env) {
+  return validSecret(env.SNOWFLAKE_DISPATCH_SECRET) &&
+    ![env.STORE_SECRET, env.ADMISSION_SECRET, env.METRICS_SECRET]
+      .includes(env.SNOWFLAKE_DISPATCH_SECRET);
 }
 
 function modelBindingEnforced(env) {
@@ -261,6 +271,116 @@ async function admissionMetrics(db) {
         WHERE day >= ? AND day <= ?
     ) GROUP BY day ORDER BY day`, [start, end, start, end])]);
   return { evidence_class: "DECLARED", receipt_minted: false, days: result.results };
+}
+
+async function sha256(value) {
+  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(value));
+  return [...new Uint8Array(digest)]
+    .map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function dispatchIdentity(data, admittedRevision) {
+  fields(data, ["op", "request_id", "target", "rows"]);
+  string(data.request_id, 36, UUID_V4);
+  fields(data.target, ["account", "user", "role", "warehouse", "database", "schema", "table"]);
+  const target = {
+    account: string(data.target.account, 128, ACCOUNT_IDENTIFIER),
+    user: string(data.target.user, 128, SAFE_IDENTIFIER),
+    role: string(data.target.role, 128, SAFE_IDENTIFIER),
+    warehouse: string(data.target.warehouse, 128, SAFE_IDENTIFIER),
+    database: string(data.target.database, 128, SAFE_IDENTIFIER),
+    schema: string(data.target.schema, 128, SAFE_IDENTIFIER),
+    table: string(data.target.table, 128, SAFE_IDENTIFIER),
+  };
+  if (target.table !== "DAILY_ADMISSIONS" || !Array.isArray(data.rows) ||
+      data.rows.length < 1 || data.rows.length > 30) {
+    throw new StoreError("invalid_value");
+  }
+  const rows = [];
+  let previous = null;
+  let sourceRevision = null;
+  const today = new Date();
+  const end = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()))
+    .toISOString().slice(0, 10);
+  const start = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(),
+    today.getUTCDate() - 30)).toISOString().slice(0, 10);
+  for (const value of data.rows) {
+    fields(value, ["day", "conversations_admitted", "runs_admitted", "source_revision",
+      "schema_version", "idempotency_key"]);
+    const day = string(value.day, 10, /^\d{4}-\d{2}-\d{2}$/);
+    const parsed = new Date(`${day}T00:00:00.000Z`);
+    if (Number.isNaN(parsed.valueOf()) || parsed.toISOString().slice(0, 10) !== day ||
+        day < start || day >= end ||
+        (previous !== null && day <= previous)) {
+      throw new StoreError("invalid_value");
+    }
+    const revision = string(value.source_revision, 40, REVISION);
+    if (revision !== admittedRevision) throw new StoreError("dispatch_source_unbound", 503);
+    if (sourceRevision !== null && revision !== sourceRevision) throw new StoreError("invalid_value");
+    sourceRevision = revision;
+    if (value.schema_version !== METRICS_SCHEMA_VERSION) throw new StoreError("invalid_value");
+    const idempotencyKey = string(value.idempotency_key, 64, SHA256);
+    const expectedKey = await sha256(`${revision}:${METRICS_SCHEMA_VERSION}:${day}`);
+    if (idempotencyKey !== expectedKey) throw new StoreError("invalid_value");
+    rows.push({
+      day,
+      conversations_admitted: integer(value.conversations_admitted, 0, 200),
+      runs_admitted: integer(value.runs_admitted, 0, 200),
+      source_revision: revision,
+      schema_version: METRICS_SCHEMA_VERSION,
+      idempotency_key: idempotencyKey,
+    });
+    previous = day;
+  }
+  const targetJson = JSON.stringify(target);
+  const payloadJson = JSON.stringify(rows);
+  return { requestId: data.request_id, targetJson, payloadJson,
+    targetSha256: await sha256(targetJson), payloadSha256: await sha256(payloadJson) };
+}
+
+function publicDispatchHold(row, dispatchPermitted = false) {
+  return { status: dispatchPermitted ? "reserved" : "held",
+    dispatch_permitted: dispatchPermitted,
+    hold: { request_id: row.request_id, target: JSON.parse(row.target_json),
+      target_sha256: row.target_sha256, rows: JSON.parse(row.payload_json),
+      payload_sha256: row.payload_sha256, state: row.state, created_at: row.created_at,
+      evidence_class: row.evidence_class, signing_status: row.signing_status } };
+}
+
+async function reserveSnowflakeDispatch(db, data, admittedRevision) {
+  if (!REVISION.test(admittedRevision || "")) {
+    throw new StoreError("dispatch_custody_unavailable", 503);
+  }
+  const identity = await dispatchIdentity(data, admittedRevision);
+  const now = new Date().toISOString();
+  const results = await batch(db, [
+    prepared(db, `INSERT INTO snowflake_dispatch_holds
+      (slot, request_id, target_json, target_sha256, payload_json, payload_sha256,
+       state, created_at, evidence_class, signing_status)
+      SELECT 1, ?, ?, ?, ?, ?, 'HELD_UNKNOWN', ?, 'DECLARED', 'UNSIGNED'
+      WHERE EXISTS (SELECT 1 FROM snowflake_dispatch_schema WHERE id = 1 AND version = 1)
+        AND NOT EXISTS (SELECT 1 FROM snowflake_dispatch_holds)`,
+    [identity.requestId, identity.targetJson, identity.targetSha256,
+      identity.payloadJson, identity.payloadSha256, now]),
+    prepared(db, "SELECT * FROM snowflake_dispatch_holds WHERE slot = 1"),
+  ]);
+  const row = results[1].results[0];
+  if (!row) throw new StoreError("dispatch_custody_unavailable", 503);
+  const inserted = results[0].meta.changes === 1;
+  const same = row.request_id === identity.requestId &&
+    row.target_sha256 === identity.targetSha256 && row.payload_sha256 === identity.payloadSha256;
+  if (!inserted && !same) throw new StoreError("dispatch_held", 409);
+  return publicDispatchHold(row, inserted);
+}
+
+async function readSnowflakeDispatch(db, data) {
+  fields(data, ["op"]);
+  const [result] = await batch(db, [prepared(db, `SELECT h.* FROM snowflake_dispatch_holds h
+    WHERE h.slot = 1 AND EXISTS
+      (SELECT 1 FROM snowflake_dispatch_schema WHERE id = 1 AND version = 1)`)]);
+  const row = result.results[0];
+  return row ? publicDispatchHold(row) : { status: "empty", dispatch_permitted: false,
+    hold: null };
 }
 
 async function create(db, data, source, admissionSecret) {
@@ -535,6 +655,20 @@ export default {
         if (!configuredMetricsSecret(env) || !env.DB) throw new StoreError("store_unavailable", 503);
         if (!await authorized(request, env.METRICS_SECRET)) throw new StoreError("unauthorized", 401);
         return json(await admissionMetrics(env.DB));
+      }
+      if (url.pathname === "/v1/snowflake-dispatch" && !url.search) {
+        if (request.method !== "POST") throw new StoreError("method_not_allowed", 405);
+        if (!configuredDispatchSecret(env) || !env.DB) throw new StoreError("store_unavailable", 503);
+        if (!await authorized(request, env.SNOWFLAKE_DISPATCH_SECRET)) {
+          throw new StoreError("unauthorized", 401);
+        }
+        const data = await boundedJson(request);
+        if (data?.op === "reserve") {
+          return json(await reserveSnowflakeDispatch(
+            env.DB, data, env.SNOWFLAKE_EXPORTER_REVISION), 201);
+        }
+        if (data?.op === "status") return json(await readSnowflakeDispatch(env.DB, data));
+        throw new StoreError("unknown_operation");
       }
       if (url.pathname !== "/v1/store" || url.search) throw new StoreError("not_found", 404);
       if (request.method !== "POST") throw new StoreError("method_not_allowed", 405);
