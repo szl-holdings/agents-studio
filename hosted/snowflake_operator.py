@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -56,6 +57,9 @@ def run() -> int:
         count = export_once(environ, connect=snowflake.connector.connect)
     except ExportError as error:
         print(str(error))
+        if error.diagnostic is not None:
+            print("snowflake_diagnostic=" + json.dumps(error.diagnostic, sort_keys=True,
+                                                       separators=(",", ":")))
         return 1
     finally:
         if directory is not None:

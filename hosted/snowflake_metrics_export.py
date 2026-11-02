@@ -30,7 +30,23 @@ SOURCE_REVISION_RE = re.compile(r"[0-9a-f]{40}\Z")
 
 
 class ExportError(Exception):
-    pass
+    def __init__(self, code, *, phase=None, errno=None, sqlstate=None):
+        super().__init__(code)
+        self.diagnostic = None
+        if phase in ("connect", "cursor", "execute", "cursor_close", "connection_close"):
+            self.diagnostic = {"phase": phase}
+            if type(errno) is int and 0 <= errno <= 999999:
+                self.diagnostic["errno"] = errno
+            if isinstance(sqlstate, str) and re.fullmatch(r"[0-9A-Z]{5}", sqlstate):
+                self.diagnostic["sqlstate"] = sqlstate
+
+
+def _snowflake_failure(phase, error):
+    # Keep only a local phase and bounded connector codes. Provider messages,
+    # SQL, query IDs, account names and credentials must never reach logs.
+    return ExportError("snowflake_write_uncertain", phase=phase,
+                       errno=getattr(error, "errno", None),
+                       sqlstate=getattr(error, "sqlstate", None))
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -209,21 +225,35 @@ def export_once(environ, *, opener=None, connect=None, today=None):
     if not days:
         return 0
     rows = _with_identity(days, source_revision)
+    connection = cursor = None
+    failure = None
+    phase = "connect"
     try:
         connection = connect(**config)
-        try:
-            cursor = connection.cursor()
+        phase = "cursor"
+        cursor = connection.cursor()
+        phase = "execute"
+        cursor.execute(MERGE_SQL.format(table=_qualified_table(config)),
+                       (json.dumps(rows, separators=(",", ":")),))
+    except Exception as error:
+        failure = _snowflake_failure(phase, error)
+    finally:
+        if cursor is not None:
             try:
-                cursor.execute(MERGE_SQL.format(table=_qualified_table(config)),
-                               (json.dumps(rows, separators=(",", ":")),))
-            finally:
                 cursor.close()
-        finally:
-            connection.close()
-    except Exception:
-        # Do not leak provider exceptions or bearer material. Production retry
-        # behavior remains UNKNOWN until a real transport has been reviewed.
-        raise ExportError("snowflake_write_uncertain") from None
+            except Exception as error:
+                if failure is None:
+                    failure = _snowflake_failure("cursor_close", error)
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception as error:
+                if failure is None:
+                    failure = _snowflake_failure("connection_close", error)
+    if failure is not None:
+        # Preserve the first failure even if cleanup also fails. A diagnostic
+        # phase is not provider reconciliation or permission to retry.
+        raise failure from None
     return len(days)
 
 
