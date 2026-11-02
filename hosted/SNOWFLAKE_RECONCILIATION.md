@@ -139,5 +139,10 @@ actual account and object identity; names alone do not establish custody.
   secret custody, request limits and spending controls before admission.
 
 The local SQLite reopen test proves only that its committed prototype hold is
-retained on the same local disk. No production custody, provider idempotency,
-successful export, independent approval or live account change is claimed.
+retained on the same local disk. The D1 migration, authenticated hold endpoint,
+first-response-only dispatch adapter and read-only reconciliation function now
+encode the required no-resend control in source. They are not invoked by the
+blocked operator and have not been migrated, configured or observed live. The
+historical attempt predates their request-bound payload record and remains
+UNKNOWN. No production custody, provider idempotency, successful export,
+independent approval or live account change is claimed.
