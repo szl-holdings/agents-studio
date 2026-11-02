@@ -28,6 +28,7 @@ ISSUER = "https://huggingface.co"
 SESSION_SECONDS = 8 * 60 * 60
 MAX_BODY_BYTES = 16384
 MAX_STORE_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_STORE_CHUNK_FRAMING_BYTES = 65536
 CONNECT_BUDGET_SECONDS = 8
 ADDRESS_BUDGET_SECONDS = 3
 IPV6_BUDGET_SECONDS = 1
@@ -672,22 +673,52 @@ class Store:
     def _read_chunked(self, tls, pending):
         output = bytearray()
         pending = bytearray(pending)
-        while True:
-            while b"\r\n" not in pending:
+        framing_bytes = 0
+
+        def read_line():
+            nonlocal pending, framing_bytes
+            while True:
+                end = pending.find(b"\r\n")
+                if end >= 0:
+                    framing_bytes += end + 2
+                    if framing_bytes > MAX_STORE_CHUNK_FRAMING_BYTES:
+                        raise StoreFailure("invalid_response", True, "response", 0, "ChunkFraming")
+                    line = bytes(pending[:end])
+                    pending = pending[end + 2:]
+                    return line
+                delimiter_bytes = 1 if pending.endswith(b"\r") else 2
+                if framing_bytes + len(pending) + delimiter_bytes > MAX_STORE_CHUNK_FRAMING_BYTES:
+                    raise StoreFailure("invalid_response", True, "response", 0, "ChunkFraming")
                 block = tls.recv(16384)
                 if not block:
                     raise StoreFailure("invalid_response", True, "response", 0, "Truncated")
                 pending.extend(block)
-            line, rest = pending.split(b"\r\n", 1)
-            pending = bytearray(rest)
-            try:
-                size = int(line.split(b";", 1)[0].strip() or b"zz", 16)
-            except ValueError:
-                raise StoreFailure("invalid_response", True, "response", 0, "ChunkSize") from None
+
+        while True:
+            line = read_line()
+            size_text, extension, _value = line.partition(b";")
+            if extension:
+                size_text = size_text.rstrip(b" \t")
+            # Python's int accepts signs, prefixes and underscores that HTTP
+            # chunk-size does not. Extensions count against the shared budget.
+            if not re.fullmatch(rb"[0-9A-Fa-f]+", size_text):
+                raise StoreFailure("invalid_response", True, "response", 0, "ChunkSize")
+            size = int(size_text, 16)
             if size == 0:
-                return output
+                # RFC 9112 section 7.1: last-chunk is followed by a complete
+                # trailer section and its final CRLF, even with no trailers.
+                # Discard trailers; never merge them into trusted headers.
+                while True:
+                    trailer = read_line()
+                    if not trailer:
+                        return output
+                    if not re.fullmatch(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+:[\t\x20-\x7e\x80-\xff]*", trailer):
+                        raise StoreFailure("invalid_response", True, "response", 0, "ChunkTrailer")
             if size > MAX_STORE_RESPONSE_BYTES or len(output) + size > MAX_STORE_RESPONSE_BYTES:
                 raise StoreFailure("invalid_response", True, "response", 0, "Oversized")
+            framing_bytes += 2  # the CRLF after this chunk's data
+            if framing_bytes > MAX_STORE_CHUNK_FRAMING_BYTES:
+                raise StoreFailure("invalid_response", True, "response", 0, "ChunkFraming")
             while len(pending) < size + 2:
                 block = tls.recv(16384)
                 if not block:
