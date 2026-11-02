@@ -95,6 +95,15 @@ never committed, printed, or placed in the Space image. Configure the Worker
 URL and `METRICS_SECRET` first, then verify one bounded manual export before
 enabling the schedule.
 
+An exporter failure keeps the `snowflake_write_uncertain` outcome and exit code
+1. The operator also prints `snowflake_diagnostic` with the first failing local
+phase (`connect`, `cursor`, `execute`, `cursor_close`, or `connection_close`)
+and, when available and well-formed, only the connector's numeric `errno` and
+five-character `sqlstate`. Provider messages, SQL, query IDs and credentials
+are excluded. Cleanup failures do not replace the original failure. These
+diagnostics help triage an existing failure; they neither reconcile its remote
+outcome nor authorize a retry. They cannot recover details from older runs.
+
 `MODEL_ENABLED=1` starts the pinned CPU model loader. Otherwise generation is
 UNAVAILABLE, never simulated. CPU Basic can sleep. The 45-second generation
 timeout is best effort; it is not a hard execution deadline or SLA.

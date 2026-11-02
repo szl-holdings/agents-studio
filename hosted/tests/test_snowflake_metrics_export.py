@@ -152,6 +152,45 @@ class ExportTests(unittest.TestCase):
         connection.cursor.return_value.close.assert_called_once()
         connection.close.assert_called_once()
 
+    def test_snowflake_failures_retain_the_first_phase_and_safe_codes(self):
+        for phase in ("connect", "cursor", "execute", "cursor_close", "connection_close"):
+            with self.subTest(phase=phase):
+                error = RuntimeError("synthetic secret, SQL, account and private key")
+                error.errno = 604
+                error.sqlstate = "57014"
+                connection = mock.Mock()
+                cursor = connection.cursor.return_value
+                connect = mock.Mock(return_value=connection)
+                failures = {"connect": connect, "cursor": connection.cursor,
+                            "execute": cursor.execute, "cursor_close": cursor.close,
+                            "connection_close": connection.close}
+                failures[phase].side_effect = error
+                # Cleanup can also fail: it must not replace the first error.
+                if phase in ("cursor", "execute", "cursor_close"):
+                    connection.close.side_effect = RuntimeError("later cleanup detail")
+                if phase == "execute":
+                    cursor.close.side_effect = RuntimeError("later cursor detail")
+                with self.assertRaises(ExportError) as caught:
+                    export_once(environment(), opener=self.opener(), connect=connect, today=TODAY)
+                self.assertEqual(str(caught.exception), "snowflake_write_uncertain")
+                self.assertEqual(caught.exception.diagnostic,
+                                 {"phase": phase, "errno": 604, "sqlstate": "57014"})
+                connect.assert_called_once()
+                self.assertEqual(cursor.execute.call_count, 0 if phase in ("connect", "cursor") else 1)
+                self.assertEqual(cursor.close.call_count, 0 if phase in ("connect", "cursor") else 1)
+                self.assertEqual(connection.close.call_count, 0 if phase == "connect" else 1)
+
+    def test_provider_diagnostics_reject_non_codes_and_private_details(self):
+        for errno, sqlstate in ((True, "secret"), ("604", "57014\nprivate"),
+                               (-1, None), (1000000, 57014), (None, "abcde")):
+            with self.subTest(errno=errno, sqlstate=sqlstate):
+                error = RuntimeError("must never appear in a diagnostic")
+                error.errno, error.sqlstate = errno, sqlstate
+                with self.assertRaises(ExportError) as caught:
+                    export_once(environment(), opener=self.opener(),
+                                connect=mock.Mock(side_effect=error), today=TODAY)
+                self.assertEqual(caught.exception.diagnostic, {"phase": "connect"})
+
     def test_boundary_days_are_inclusive_and_duplicates_rejected(self):
         rows = [{**ROWS[0], "day": "2026-09-29"}, ROWS[1]]
         self.assertEqual(parse_metrics({**DOCUMENT, "days": rows}, TODAY), rows)
