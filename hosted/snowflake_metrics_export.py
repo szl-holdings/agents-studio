@@ -127,7 +127,24 @@ def fetch_metrics(secret, *, opener=None, today=None, url=METRICS_URL):
         with opener.open(request, timeout=15) as response:
             if response.status != 200 or response.geturl() != url:
                 raise ExportError("metrics_unavailable")
+            headers = getattr(response, "headers", None)
+            lengths = headers.get_all("Content-Length", []) if headers is not None else []
+            expected_length = None
+            if lengths:
+                if (len(lengths) != 1 or not re.fullmatch(r"[0-9]+", lengths[0].strip())
+                        or headers.get("Transfer-Encoding") is not None):
+                    raise ExportError("metrics_invalid")
+                try:
+                    expected_length = int(lengths[0])
+                except ValueError:
+                    raise ExportError("metrics_invalid") from None
+                if expected_length > MAX_RESPONSE_BYTES:
+                    raise ExportError("metrics_invalid")
             raw = response.read(MAX_RESPONSE_BYTES + 1)
+            # A bounded HTTPResponse.read() can return a valid JSON prefix
+            # without raising when the declared body is truncated.
+            if expected_length is not None and len(raw) != expected_length:
+                raise ExportError("metrics_unavailable")
         if len(raw) > MAX_RESPONSE_BYTES:
             raise ExportError("metrics_invalid")
         data = json.loads(raw)
@@ -264,3 +281,4 @@ if __name__ == "__main__":
         print(str(error))
         raise SystemExit(1) from None
     print(f"aggregate_days_exported={count}")
+
