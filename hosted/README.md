@@ -127,6 +127,19 @@ storage is reported as `UNKNOWN`, no store call is made, and `/readyz` returns
 replicas have separate budgets, and other authenticated store operations are
 not covered.
 
+### Redacted exporter diagnostics behind the hold
+
+The blocked scheduled operator does not import a connector, read credentials,
+fetch metrics or call the exporter. Its output remains
+`snowflake_transport_not_verified`; diagnostic code does not authorize dispatch.
+
+The exporter retains PR34's bounded first-failure phase, integer errno and
+five-character SQLSTATE for offline synthetic transport tests and a future
+separately qualified caller. Provider messages, SQL, query IDs, identities and
+credentials remain excluded. `snowflake_write_uncertain` and no-retry behavior
+are preserved. These diagnostics do not reconcile old runs or prove whether a
+write committed. No current scheduled export reaches this diagnostic path.
+
 ## Owner end-to-end witness
 
 `tools/verify_agents_studio.py` is run by the owner on their own Windows PC,
