@@ -68,6 +68,23 @@ class MetricsFramingTests(unittest.TestCase):
             export_once(environment(), opener=opener, connect=connect, today=TODAY)
         connect.assert_not_called()
 
+    def export_chunked(self, truncated):
+        body = json.dumps(DOCUMENT).encode("utf-8")
+        # A valid JSON prefix does not make an incomplete HTTP message valid.
+        size = len(body) + 20 if truncated else len(body)
+        wire_body = f"{size:x}\r\n".encode() + body + b"\r\n"
+        opener, connect = mock.Mock(), mock.Mock()
+        opener.open.return_value = response(wire_body, b"Transfer-Encoding: chunked\r\n")
+        with self.assertRaisesRegex(ExportError, "^metrics_unavailable$"):
+            export_once(environment(), opener=opener, connect=connect, today=TODAY)
+        connect.assert_not_called()
+
+    def test_truncated_chunk_is_classified_before_sql(self):
+        self.export_chunked(truncated=True)
+
+    def test_missing_terminal_chunk_is_classified_before_sql(self):
+        self.export_chunked(truncated=False)
+
 
 if __name__ == "__main__":
     unittest.main()
