@@ -1100,6 +1100,111 @@ class StoreTransportTests(unittest.TestCase):
         self.assertEqual(body["schema_version"], 1)
         self.assertEqual(harness.events.count(("send",)), 1)
 
+    def test_truncated_chunked_purge_acknowledgement_stays_uncertain(self):
+        body = b'{"status":"deleted","deleted":1}'
+        first = format(len(body), "x").encode() + b"\r\n" + body + b"\r\n"
+        for ending in (b"0\r\n", b"0\r\nX-Test: yes\r\n"):
+            with self.subTest(ending=ending):
+                harness = TransportHarness(["ok"], addresses=2)
+                harness.payload = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                   b"Transfer-Encoding: chunked\r\n\r\n" + first + ending)
+                result, _logs = self._run(harness, self._store(harness), "purge", owner="ab" * 32)
+                self.assertIsInstance(result, ApiError)
+                self.assertEqual(result.reason, "invalid_response")
+                self.assertTrue(result.submitted)
+                self.assertEqual(harness.events.count(("send",)), 1)
+
+    def test_chunk_metadata_is_bounded_before_consuming_the_stream(self):
+        harness = TransportHarness(["ok"], addresses=2)
+        harness.payload = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                           b"Transfer-Encoding: chunked\r\n\r\n1;" + b"x" * (256 * 1024))
+        result, _logs = self._run(harness, self._store(harness), "purge", owner="ab" * 32)
+        self.assertIsInstance(result, ApiError)
+        self.assertEqual(result.reason, "invalid_response")
+        self.assertTrue(result.submitted)
+        self.assertGreater(len(harness.payload), 128 * 1024)
+        self.assertEqual(harness.events.count(("send",)), 1)
+
+    def test_many_small_chunk_extensions_share_one_metadata_budget(self):
+        harness = TransportHarness(["ok"], addresses=2)
+        chunks = b"".join(b"1;pad=" + b"x" * 8192 + b"\r\n" + bytes([byte]) + b"\r\n"
+                          for byte in b"{}          ")
+        harness.payload = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                           b"Transfer-Encoding: chunked\r\n\r\n" + chunks + b"0\r\n\r\n")
+        result, _logs = self._run(harness, self._store(harness), "purge", owner="ab" * 32)
+        self.assertIsInstance(result, ApiError)
+        self.assertTrue(result.submitted)
+        self.assertEqual(harness.events.count(("send",)), 1)
+
+    def test_chunk_sizes_require_http_hex_digits(self):
+        for size in (b"+2", b"0x2", b"0_2", b"-0"):
+            with self.subTest(size=size):
+                harness = TransportHarness(["ok"], addresses=2)
+                chunks = (b"2\r\n{}\r\n-0\r\n\r\n" if size == b"-0" else
+                          size + b"\r\n{}\r\n0\r\n\r\n")
+                harness.payload = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                   b"Transfer-Encoding: chunked\r\n\r\n" + chunks)
+                result, _logs = self._run(harness, self._store(harness), "purge", owner="ab" * 32)
+                self.assertIsInstance(result, ApiError)
+                self.assertTrue(result.submitted)
+                self.assertEqual(harness.events.count(("send",)), 1)
+
+    def test_chunked_extensions_and_trailers_complete_without_waiting_for_close(self):
+        harness = TransportHarness(["ok-hold"], addresses=1)
+        harness.payload = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                           b"Transfer-Encoding: chunked\r\n\r\n"
+                           b"2 ; ignored=value\r\n{}\r\n00;end=yes\r\nX-Ignored: value\r\n\r\n")
+        result, _logs = self._run(harness, self._store(harness))
+        self.assertEqual(result, {})
+        self.assertEqual(harness.events.count(("send",)), 1)
+
+    def test_chunked_framing_handles_one_byte_reads(self):
+        raw = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+               b"Transfer-Encoding: chunked\r\n\r\n"
+               b"1\r\n{\r\n1\r\n}\r\n0\r\nX-Ignored: value\r\n\r\n")
+        tls = mock.Mock()
+        tls.recv.side_effect = [bytes([byte]) for byte in raw]
+        decoded = Store("https://example.account.workers.dev", "b" * 32)._read_response(tls)
+        self.assertEqual(decode_store_response(decoded), {})
+        self.assertEqual(tls.recv.call_count, len(raw))
+
+    def test_chunked_trailer_budget_and_syntax_fail_closed(self):
+        for trailer in (b"no-colon\r\n", b" folded: value\r\n", b"X: bad\x00value\r\n",
+                        b"X: " + b"x" * (256 * 1024)):
+            with self.subTest(trailer_size=len(trailer)):
+                harness = TransportHarness(["ok"], addresses=2)
+                harness.payload = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                   b"Transfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n" + trailer)
+                result, _logs = self._run(harness, self._store(harness), "purge", owner="ab" * 32)
+                self.assertIsInstance(result, ApiError)
+                self.assertTrue(result.submitted)
+                self.assertEqual(harness.events.count(("send",)), 1)
+                if len(trailer) > 128 * 1024:
+                    self.assertGreater(len(harness.payload), 128 * 1024)
+
+    def test_chunked_framing_budget_boundary(self):
+        for extra in (0, 1):
+            with self.subTest(extra=extra):
+                harness = TransportHarness(["ok-hold"], addresses=1)
+                # 14 framing bytes outside the trailer value; total limit 64 KiB.
+                harness.payload = (b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                   b"Transfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\nX:"
+                                   + b"x" * (65536 - 14 + extra) + b"\r\n\r\n")
+                result, _logs = self._run(harness, self._store(harness))
+                if extra:
+                    self.assertIsInstance(result, ApiError)
+                    self.assertTrue(result.submitted)
+                else:
+                    self.assertEqual(result, {})
+
+    def test_chunked_exact_budget_allows_fragmented_final_crlf(self):
+        tls = mock.Mock()
+        tls.recv.side_effect = [b"\r", b"\n"]
+        pending = b"2\r\n{}\r\n0\r\nX:" + b"x" * (65536 - 14) + b"\r\n"
+        store = Store("https://example.account.workers.dev", "b" * 32)
+        self.assertEqual(store._read_chunked(tls, pending), b"{}")
+        self.assertEqual(tls.recv.call_count, 2)
+
     def test_ipv6_stall_stays_inside_one_second_and_ipv4_still_runs(self):
         harness = TransportHarness(["ok"], addresses=1, ipv6_modes=["connect-timeout"])
         harness.response('{"status":"available","schema_version":1,"receipt_minted":false}')
