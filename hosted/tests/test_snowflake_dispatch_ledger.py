@@ -1,5 +1,7 @@
 import json
+from pathlib import Path
 import sqlite3
+import tempfile
 import unittest
 import uuid
 
@@ -38,6 +40,24 @@ class LedgerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             reserve_once(self.db, self.request_id, "a" * 64, "b" * 64)
         self.assertTrue(self.db.in_transaction)
+
+    def test_committed_hold_survives_reopen_and_never_releases_unknown(self):
+        # This is local SQLite persistence, not production custody admission.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dispatch.sqlite"
+            first = sqlite3.connect(path)
+            reserve_once(first, self.request_id, "a" * 64, "b" * 64)
+            original = first.execute("SELECT * FROM studio_dispatch_hold").fetchall()
+            first.close()  # An external outcome remains unknown across restart.
+            for request in (self.request_id, str(uuid.uuid4())):
+                reopened = sqlite3.connect(path)
+                try:
+                    with self.assertRaises(DispatchHeld):
+                        reserve_once(reopened, request, "a" * 64, "b" * 64)
+                    self.assertEqual(reopened.execute(
+                        "SELECT * FROM studio_dispatch_hold").fetchall(), original)
+                finally:
+                    reopened.close()
 
 
 if __name__ == "__main__":
