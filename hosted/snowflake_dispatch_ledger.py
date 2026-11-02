@@ -50,8 +50,15 @@ def reserve_once(connection, request_id, target_sha256, payload_sha256):
             raise DispatchHeld("dispatch_already_held")
         connection.execute("INSERT INTO studio_dispatch_hold VALUES (1, ?, ?, ?, ?, ?)",
                            (request_id, target_sha256, payload_sha256, encoded, receipt_sha256))
-        connection.commit()
+        # Match the explicit BEGIN with SQL transaction control. Python 3.12's
+        # Connection.commit()/rollback() are no-ops with autocommit=True, even
+        # when BEGIN IMMEDIATE opened a transaction. Return a receipt only after
+        # this reservation has actually committed.
+        connection.execute("COMMIT")
     except Exception:
-        connection.rollback()
+        # A lost acknowledgement can follow a successful commit. In that case
+        # retain the hold; there is no active transaction left to roll back.
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
         raise
     return {"receipt_sha256": receipt_sha256, "receipt": record}
