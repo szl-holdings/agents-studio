@@ -158,6 +158,24 @@ class ExportTests(unittest.TestCase):
         with self.assertRaises(ExportError):
             parse_metrics({**DOCUMENT, "days": rows[::-1]}, TODAY)
 
+    def test_acknowledged_execute_with_cleanup_failure_remains_uncertain(self):
+        # Autocommit may already have persisted the MERGE when cleanup fails.
+        # Never reinterpret this as no write, or execute a second time.
+        for failure in ("cursor_close", "connection_close"):
+            with self.subTest(failure=failure):
+                connection = mock.Mock()
+                cursor = connection.cursor.return_value
+                close = cursor.close if failure == "cursor_close" else connection.close
+                close.side_effect = OSError("synthetic private detail")
+                connect = mock.Mock(return_value=connection)
+                with self.assertRaisesRegex(ExportError, "^snowflake_write_uncertain$"):
+                    export_once(environment(), opener=self.opener(), connect=connect,
+                                today=TODAY)
+                connect.assert_called_once()
+                cursor.execute.assert_called_once()
+                cursor.close.assert_called_once()
+                connection.close.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

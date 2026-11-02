@@ -83,17 +83,20 @@ this endpoint to transfer metrics. The Worker retains its full D1 binding; the
 separate secret limits only access through this endpoint, not D1 permissions.
 This source change alone neither configures nor verifies a Snowflake connection.
 
-The one-writer operator is `snowflake_operator.py`, run by the gated
-`.github/workflows/snowflake-metrics.yml` workflow outside the Space. The
-workflow is skipped unless the repository variable `SZL_METRICS_EXPORT_ENABLED`
-is exactly `1`; this prevents a schedule from becoming a live writer before
-the Worker route and secret custody are read back. It uses a single concurrency
-group with cancellation disabled, so an in-flight export is never replaced by
-a second writer. The private key is supplied only as a base64-encoded CI secret,
-written to a short-lived 0600 file, and removed after the process exits. It is
-never committed, printed, or placed in the Space image. Configure the Worker
-URL and `METRICS_SECRET` first, then verify one bounded manual export before
-enabling the schedule.
+The Snowflake operator entrypoint is currently **BLOCKED**. It exits nonzero
+with `snowflake_transport_not_verified` before importing the connector, reading
+credentials, fetching metrics, or writing anything. The scheduled workflow
+retains that explicit failure when `SZL_METRICS_EXPORT_ENABLED=1`; the variable
+only schedules an admission check and cannot enable a transport. The workflow
+does not install the connector or pass secrets to this blocked entrypoint.
+
+The former operator supplied a real connector through the exporter's synthetic
+test hook and overrode the disabled-service declaration. A concurrency group
+prevented overlap but supplied no durable uncertainty hold between runs. This
+source repair closes that bypass; it does not reconcile a previous write or
+make the export operational. See [Snowflake reconciliation and admission](SNOWFLAKE_RECONCILIATION.md)
+for the historical unknown outcome, bounded readback procedure, and evidence
+required before a separately reviewed production adapter can be admitted.
 
 `MODEL_ENABLED=1` starts the pinned CPU model loader. Otherwise generation is
 UNAVAILABLE, never simulated. CPU Basic can sleep. The 45-second generation
