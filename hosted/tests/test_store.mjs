@@ -7,6 +7,7 @@ import worker from "../edge/store.mjs";
 const schema = readFileSync(new URL("../edge/schema.sql", import.meta.url), "utf8");
 const migration = readFileSync(new URL("../edge/migrations/0002_admission_key_epoch.sql", import.meta.url), "utf8");
 const bindingMigration = readFileSync(new URL("../edge/migrations/0003_run_model_bindings.sql", import.meta.url), "utf8");
+const dispatchMigration = readFileSync(new URL("../edge/migrations/0004_snowflake_dispatch_hold.sql", import.meta.url), "utf8");
 const OWNER_A = "a".repeat(64);
 const OWNER_B = "b".repeat(64);
 const SECRET = "synthetic-local-test-secret-not-for-deployment";
@@ -14,6 +15,7 @@ const ADMISSION_SECRET = "synthetic-independent-admission-key-for-tests";
 const ROTATED_SECRET = "synthetic-rotated-store-secret-for-tests";
 const ROTATED_ADMISSION_SECRET = "synthetic-rotated-admission-secret-for-tests";
 const METRICS_SECRET = "synthetic-independent-metrics-secret-for-tests";
+const DISPATCH_SECRET = "synthetic-independent-dispatch-secret-for-tests";
 
 // The adapter models the D1 binding API and executes every guard against SQLite.
 // It does not claim to test Cloudflare's deployed runtime or network semantics.
@@ -54,7 +56,8 @@ class LocalD1 {
     assert.ok(["conversations", "conversation_admissions", "owner_conversation_admissions",
       "admission_epoch_schema", "admission_key_epochs",
       "runs", "run_model_bindings", "run_admissions", "owner_run_admissions", "messages",
-      "receipts", "erasure_receipts"].includes(table));
+      "receipts", "erasure_receipts", "snowflake_dispatch_schema",
+      "snowflake_dispatch_holds"].includes(table));
     return this.sqlite.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get().n;
   }
 }
@@ -113,6 +116,35 @@ function seedCompleted(env, owner, id, day = new Date().toISOString().slice(0, 1
     128, 'fixture answer', 3, NULL, ?, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:01.000Z')`)
     .run(runId, owner, id, crypto.randomUUID(), "d".repeat(64), day);
   return runId;
+}
+
+async function digest(value) {
+  const bytes = new TextEncoder().encode(value);
+  const result = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(result)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function dispatchReservation(requestId = crypto.randomUUID(), changes = {}) {
+  const sourceRevision = "d".repeat(40);
+  const now = new Date();
+  const day = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1))
+    .toISOString().slice(0, 10);
+  return { op: "reserve", request_id: requestId,
+    target: { account: "synthetic-account", user: "SZL_STUDIO_METRICS_SERVICE",
+      role: "SZL_STUDIO_METRICS_WRITER", warehouse: "METRICS_WH", database: "METRICS_DB",
+      schema: "TELEMETRY", table: "DAILY_ADMISSIONS" },
+    rows: [{ day, conversations_admitted: 2, runs_admitted: 3,
+      source_revision: sourceRevision, schema_version: "szl.metrics.daily-admissions/v2",
+      idempotency_key: await digest(`${sourceRevision}:szl.metrics.daily-admissions/v2:${day}`) }],
+    ...changes };
+}
+
+async function dispatchCall(env, data, secret = DISPATCH_SECRET) {
+  const response = await worker.fetch(new Request("https://store.example/v1/snowflake-dispatch", {
+    method: "POST", headers: { authorization: `Bearer ${secret}`,
+      "content-type": "application/json" }, body: JSON.stringify(data),
+  }), env);
+  return { status: response.status, data: await response.json() };
 }
 
 test("health is a read-only declaration, not database readiness", async (t) => {
@@ -174,6 +206,98 @@ test("metrics expose only recent owner-free admission counters under an independ
   const unavailable = await worker.fetch(req(METRICS_SECRET), env);
   assert.equal(unavailable.status, 503);
   assert.deepEqual(await unavailable.json(), { error: "store_unavailable" });
+});
+
+test("durable dispatch custody permits only the first exact reservation", async (t) => {
+  const env = { ...environment(t), SNOWFLAKE_DISPATCH_SECRET: DISPATCH_SECRET,
+    SNOWFLAKE_EXPORTER_REVISION: "d".repeat(40) };
+  const request = await dispatchReservation();
+  const first = await dispatchCall(env, request);
+  assert.equal(first.status, 201);
+  assert.equal(first.data.status, "reserved");
+  assert.equal(first.data.dispatch_permitted, true);
+  assert.equal(first.data.hold.state, "HELD_UNKNOWN");
+  assert.equal(first.data.hold.evidence_class, "DECLARED");
+  assert.equal(first.data.hold.signing_status, "UNSIGNED");
+  assert.equal(first.data.hold.request_id, request.request_id);
+  assert.equal(first.data.hold.payload_sha256, await digest(JSON.stringify(request.rows)));
+  assert.equal(first.data.hold.target_sha256, await digest(JSON.stringify(request.target)));
+  assert.equal(env.DB.count("snowflake_dispatch_holds"), 1);
+
+  // A lost HTTP acknowledgement can only be followed by this held replay. It
+  // never emits a second dispatch permission, even for the same request body.
+  const replay = await dispatchCall(env, request);
+  assert.equal(replay.status, 201);
+  assert.equal(replay.data.status, "held");
+  assert.equal(replay.data.dispatch_permitted, false);
+  assert.deepEqual(replay.data.hold, first.data.hold);
+
+  const different = await dispatchCall(env, await dispatchReservation());
+  assert.equal(different.status, 409);
+  assert.deepEqual(different.data, { error: "dispatch_held" });
+  assert.equal(env.DB.count("snowflake_dispatch_holds"), 1);
+
+  env.DB.calls.length = 0;
+  const status = await dispatchCall(env, { op: "status" });
+  assert.equal(status.status, 200);
+  assert.equal(status.data.dispatch_permitted, false);
+  assert.deepEqual(status.data.hold, first.data.hold);
+  assert.ok(env.DB.calls.every(({ sql }) => sql.trim().startsWith("SELECT")));
+});
+
+test("dispatch custody is credential-isolated, validated, and atomic", async (t) => {
+  const env = { ...environment(t), METRICS_SECRET,
+    SNOWFLAKE_DISPATCH_SECRET: DISPATCH_SECRET,
+    SNOWFLAKE_EXPORTER_REVISION: "d".repeat(40) };
+  const request = await dispatchReservation();
+  for (const secret of [SECRET, ADMISSION_SECRET, METRICS_SECRET, `${DISPATCH_SECRET}x`]) {
+    assert.equal((await dispatchCall(env, request, secret)).status, 401);
+  }
+  for (const value of [undefined, "short", SECRET, ADMISSION_SECRET, METRICS_SECRET]) {
+    const result = await dispatchCall({ ...env, SNOWFLAKE_DISPATCH_SECRET: value }, request);
+    assert.equal(result.status, 503);
+  }
+  assert.equal(env.DB.count("snowflake_dispatch_holds"), 0);
+
+  for (const revision of [undefined, "c".repeat(40)]) {
+    const result = await dispatchCall({ ...env, SNOWFLAKE_EXPORTER_REVISION: revision }, request);
+    assert.equal(result.status, 503);
+  }
+  assert.equal(env.DB.count("snowflake_dispatch_holds"), 0);
+
+  const malformed = [
+    { ...request, request_id: crypto.randomUUID().replace(/-4/, "-1") },
+    { ...request, target: { ...request.target, table: "OTHER" } },
+    { ...request, rows: [{ ...request.rows[0], conversations_admitted: true }] },
+    { ...request, rows: [{ ...request.rows[0], idempotency_key: "a".repeat(64) }] },
+    { ...request, rows: [request.rows[0], request.rows[0]] },
+  ];
+  for (const body of malformed) assert.equal((await dispatchCall(env, body)).status, 400);
+  assert.equal(env.DB.count("snowflake_dispatch_holds"), 0);
+
+  env.DB.failOn = "INSERT INTO snowflake_dispatch_holds";
+  assert.equal((await dispatchCall(env, request)).status, 503);
+  env.DB.failOn = null;
+  assert.equal(env.DB.count("snowflake_dispatch_holds"), 0);
+
+  const [a, b] = await Promise.all([
+    dispatchCall(env, request), dispatchCall(env, await dispatchReservation()),
+  ]);
+  assert.equal([a, b].filter((result) => result.data.dispatch_permitted === true).length, 1);
+  assert.equal([a.status, b.status].filter((status) => status === 409).length, 1);
+  assert.equal(env.DB.count("snowflake_dispatch_holds"), 1);
+});
+
+test("dispatch migration is idempotent and never fabricates a prior hold", (t) => {
+  const db = new DatabaseSync(":memory:");
+  t.after(() => db.close());
+  db.exec(`CREATE TABLE studio_schema (id INTEGER PRIMARY KEY CHECK (id = 1),
+    version INTEGER NOT NULL CHECK (version = 1));
+    INSERT INTO studio_schema (id, version) VALUES (1, 1);`);
+  db.exec(dispatchMigration);
+  db.exec(dispatchMigration);
+  assert.equal(db.prepare("SELECT version FROM snowflake_dispatch_schema WHERE id = 1").get().version, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM snowflake_dispatch_holds").get().n, 0);
 });
 
 test("authenticated readiness checks schema without creating state", async (t) => {

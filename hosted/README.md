@@ -49,8 +49,11 @@ and account erasure remain available for existing data.
 For an identified new database, apply `edge/schema.sql` after permission and
 billing readback. For an existing version-1 database, preserve and back it up,
 then apply the additive migrations in order: `edge/migrations/0002_admission_key_epoch.sql`
-and `edge/migrations/0003_run_model_bindings.sql`. For a database that already
-has migration 0002, apply only 0003. Stage the cutover: back up the identified
+and `edge/migrations/0003_run_model_bindings.sql`. The separate Snowflake
+dispatch-custody source also adds `edge/migrations/0004_snowflake_dispatch_hold.sql`;
+applying it creates an empty irreversible hold slot and does not enable an
+export. For a database that already has migration 0002, apply the remaining
+migrations in order. Stage the cutover: back up the identified
 database, apply the migration, deploy the compatible Worker, deploy the Space
 that sends and verifies model pins, then set the Worker's
 `REQUIRE_MODEL_BINDING=1`. Read back a fresh authenticated `check` showing
@@ -97,6 +100,35 @@ source repair closes that bypass; it does not reconcile a previous write or
 make the export operational. See [Snowflake reconciliation and admission](SNOWFLAKE_RECONCILIATION.md)
 for the historical unknown outcome, bounded readback procedure, and evidence
 required before a separately reviewed production adapter can be admitted.
+
+`snowflake_durable_dispatch.py` now contains the offline-qualified boundary for
+that future adapter. A dedicated Worker `SNOWFLAKE_DISPATCH_SECRET` and matching
+operator `STUDIO_SNOWFLAKE_DISPATCH_SECRET`, distinct from the Store, admission
+and metrics credentials, protect
+`POST /v1/snowflake-dispatch`. The first exact reservation stores the writer,
+target, canonical aggregate payload, digests and request ID in D1 before a
+provider connection can open. Worker `SNOWFLAKE_EXPORTER_REVISION` must bind the
+payload to the exact admitted exporter source. Only the response that created the row carries
+`dispatch_permitted: true`; a replay, competing request, timeout or lost response
+cannot produce another permission. The schema exposes no update or delete path,
+so the hold remains `HELD_UNKNOWN` across runner and Worker restarts.
+
+The same module has an injected read-only reconciliation function. It reads the
+hold, queries provider history by the held request ID and writer identity, and
+compares destination rows with the held payload. It issues only bounded `SELECT`
+statements, hashes query IDs in its returned report, never changes the hold, and
+always returns `resend_permitted: false`. A matching observation is evidence for
+operator review; it is not an automatic release or permission to send the next
+window. The historical 2026-11-01 attempt lacks this request-bound record and
+remains UNKNOWN.
+
+These components are source preparation only. The scheduled operator remains
+hard-blocked before credentials, metrics, D1 reservation, connector import or
+Snowflake I/O. No workflow calls the durable adapter, no dispatch secret is
+configured here, and no D1 migration, provider query, export or live state
+change is claimed. Admission still requires independent readback of D1 custody,
+secret separation, real connector retry/query-tag behavior, the read-only
+observer grants, destination identity, retention and spending controls.
 
 `MODEL_ENABLED=1` starts the pinned CPU model loader. Otherwise generation is
 UNAVAILABLE, never simulated. CPU Basic can sleep. The 45-second generation
