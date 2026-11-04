@@ -265,8 +265,11 @@ test("dispatch custody is credential-isolated, validated, and atomic", async (t)
   }
   assert.equal(env.DB.count("snowflake_dispatch_holds"), 0);
 
+  // Overwrite the version nibble (index 14) itself: replacing the first "-4"
+  // also matches a second group that starts with 4 and leaves a valid v4 id.
+  const wrongVersion = crypto.randomUUID();
   const malformed = [
-    { ...request, request_id: crypto.randomUUID().replace(/-4/, "-1") },
+    { ...request, request_id: `${wrongVersion.slice(0, 14)}1${wrongVersion.slice(15)}` },
     { ...request, target: { ...request.target, table: "OTHER" } },
     { ...request, rows: [{ ...request.rows[0], conversations_admitted: true }] },
     { ...request, rows: [{ ...request.rows[0], idempotency_key: "a".repeat(64) }] },
