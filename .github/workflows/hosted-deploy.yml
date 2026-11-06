@@ -72,7 +72,9 @@ jobs:
           set -euo pipefail
           out="$RUNNER_TEMP/store-dry-run"
           cmp hosted/edge/store.mjs "$out/store.mjs"
-          extra="$(find "$out" -type f ! -name store.mjs ! -name README.md)"
+          # Match by path so a nested module that happens to be named store.mjs or
+          # README.md, or any directory of extra modules, still fails the check.
+          extra="$(find "$out" -mindepth 1 ! -path "$out/store.mjs" ! -path "$out/README.md")"
           if [ -n "$extra" ]; then
             echo "::error::dry run would upload modules besides store.mjs: $extra"
             exit 1
