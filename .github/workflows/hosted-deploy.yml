@@ -1,0 +1,151 @@
+name: Hosted store deploy
+
+# Deploys hosted/edge/store.mjs to the Cloudflare Worker "szl-agents-studio-store".
+# Control before action: Worker and deploy-contract tests, a credential-free dry
+# run, an opt-in repository variable, the cloudflare-production environment's
+# reviewers and Wrangler's required-secret check all precede any remote change.
+# Evidence after: the job fails unless the live /healthz declares this exact
+# 40-character commit SHA. Owner setup: hosted/README.md#deploy.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "hosted/edge/**"
+      - "hosted/store_deploy_readback.py"
+      - "hosted/tests/test_store.mjs"
+      - "hosted/tests/test_store_deploy_config.py"
+      - "hosted/tests/test_store_deploy_readback.py"
+      - ".github/workflows/hosted-deploy.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "hosted/edge/**"
+      - "hosted/store_deploy_readback.py"
+      - "hosted/tests/test_store.mjs"
+      - "hosted/tests/test_store_deploy_config.py"
+      - "hosted/tests/test_store_deploy_readback.py"
+      - ".github/workflows/hosted-deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  WRANGLER_SEND_METRICS: 'false'
+
+# Pull request runs supersede each other; runs on main queue so a deploy is never cut short.
+concurrency:
+  group: hosted-deploy-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: store/verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12.10'
+      - name: Install pinned Wrangler from the lockfile
+        working-directory: hosted/edge
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Worker contracts
+        run: node --test hosted/tests/test_store.mjs hosted/tests/test_studio_ui.mjs
+      - name: Deploy configuration and readback contracts
+        working-directory: hosted
+        run: python -B -m unittest discover -s tests -p 'test_store_deploy_*.py' -v
+      - name: Credential-free Wrangler dry run
+        working-directory: hosted/edge
+        run: npx --no-install wrangler deploy --dry-run --outdir "$RUNNER_TEMP/store-dry-run"
+      - name: Dry run uploads exactly the committed store.mjs
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/store-dry-run"
+          cmp hosted/edge/store.mjs "$out/store.mjs"
+          extra="$(find "$out" -type f ! -name store.mjs ! -name README.md)"
+          if [ -n "$extra" ]; then
+            echo "::error::dry run would upload modules besides store.mjs: $extra"
+            exit 1
+          fi
+          sha256sum hosted/edge/store.mjs
+
+  deploy:
+    name: store/deploy
+    needs: verify
+    # Opt-in: the owner sets the repository variable after creating the environment
+    # and its secrets (hosted/README.md#deploy). Only main is ever deployed.
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      vars.SZL_STORE_DEPLOY_ENABLED == '1'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: cloudflare-production
+      url: https://agents-store.a-11-oy.com/healthz
+    concurrency:
+      group: cloudflare-production-szl-agents-studio-store
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12.10'
+      - name: Install pinned Wrangler from the lockfile
+        working-directory: hosted/edge
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Require the environment's deploy credentials
+        env:
+          HAS_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN != '' }}
+          HAS_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID != '' }}
+        run: |
+          if [ "$HAS_TOKEN" != "true" ] || [ "$HAS_ACCOUNT" != "true" ]; then
+            echo "::error::cloudflare-production needs secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID (hosted/README.md#deploy)"
+            exit 1
+          fi
+      - name: Record the D1 restore point (Time Travel bookmark)
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3.15.0
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: hosted/edge
+          command: d1 time-travel info DB
+      - name: Apply D1 migrations (additive, idempotent)
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3.15.0
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: hosted/edge
+          command: d1 migrations apply DB --remote
+      # On push, --strict refuses to overwrite a Worker last changed outside
+      # Wrangler (dashboard or API). A manually dispatched run may reconcile it.
+      - name: Deploy the Worker with the full commit SHA
+        uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3.15.0
+        env:
+          SOURCE_REVISION: ${{ github.sha }}
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          workingDirectory: hosted/edge
+          command: deploy --message ${{ github.sha }}${{ github.event_name == 'push' && ' --strict' || '' }}
+          vars: SOURCE_REVISION
+      - name: Read back the live source revision
+        working-directory: hosted
+        env:
+          EXPECTED_REVISION: ${{ github.sha }}
+        run: python -B store_deploy_readback.py --url https://agents-store.a-11-oy.com/healthz --expect-revision "$EXPECTED_REVISION"
