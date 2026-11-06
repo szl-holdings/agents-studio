@@ -7,6 +7,7 @@ sdk: docker
 app_port: 7860
 hf_oauth: true
 hf_oauth_expiration_minutes: 480
+license: apache-2.0
 ---
 
 # SZL Agents Studio
