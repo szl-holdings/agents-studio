@@ -1,7 +1,9 @@
 # OpenAI Agents API curl application
 
 Private source: [szl-holdings/agents-studio](https://github.com/szl-holdings/agents-studio).
-The GitHub workflow runs offline Windows contracts with synthetic credentials.
+CI runs offline contracts with synthetic credentials: `ci.yml` on Windows for the
+local application, and `hosted.yml` on Linux for `hosted/` plus a container smoke
+test without provider access ([Repository layout](#repository-layout)).
 Source publication and green CI do not deploy or enable hosted inference.
 
 <!-- szl:header v1 -->
