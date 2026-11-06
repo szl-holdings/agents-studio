@@ -36,8 +36,11 @@ Custom Domain is deployed. `STORE_SECRET` is its independently generated server
 credential. Never use an existing local Studio or operator credential.
 
 Worker bindings: `DB` to the dedicated D1 database, secret `STORE_SECRET`, an
-independently generated `ADMISSION_SECRET`, and `SOURCE_REVISION` to the admitted
-GitHub SHA. The two secrets must be distinct. Keep `ADMISSION_SECRET` stable
+independently generated `ADMISSION_SECRET`, and `SOURCE_REVISION` to the full
+40-character admitted GitHub SHA. The deploy workflow injects it; any other value,
+including an abbreviated SHA, is reported in `/healthz` and receipts as `UNKNOWN`.
+`edge/wrangler.toml` records these bindings by name. The two secrets must be
+distinct. Keep `ADMISSION_SECRET` stable
 through each UTC day when rotating `STORE_SECRET`: the first admission records a
 day-bound, non-account fingerprint of the admission key. An unexpected same-day
 admission-key change holds new admissions even after account erasure; restore
@@ -68,9 +71,11 @@ readiness and new admissions remain held until the next UTC day. Do not backfill
 or reset those counters.
 No live D1 migration or deployment is claimed by these source instructions.
 Configure Worker logs/traces without recording Authorization, cookies, prompts
-or responses.
-Use the current `cf` CLI and official configuration schema for deployment;
-this repository does not introduce a second automatic publisher.
+or responses; `edge/wrangler.toml` keeps observability off until such a
+configuration is reviewed.
+The store Worker is published only by the opt-in, reviewer-gated workflow in
+[Deploy](#deploy), from the checked-in `edge/wrangler.toml`. It applies only the
+`edge/migrations` files, never `edge/schema.sql`, and it does not publish the Space.
 
 The optional `GET /v1/metrics` Worker endpoint exposes only existing global,
 owner-free daily run and conversation admission counts for the preceding 30
@@ -194,6 +199,79 @@ receipt, `tools/agents-studio-witness-<UTC time>.json`, is written next to the
 script and is git-ignored. A PASS is one owner-attested run, not independent
 attestation, a model-quality evaluation or a release.
 
+## Deploy
+
+The storage Worker `szl-agents-studio-store` (`edge/store.mjs`) is deployed only by
+[`.github/workflows/hosted-deploy.yml`](../.github/workflows/hosted-deploy.yml).
+[`edge/wrangler.toml`](edge/wrangler.toml) is its reviewed configuration: the code,
+compatibility date `2026-10-01`, `REQUIRE_MODEL_BINDING = "1"`, the `DB` binding to
+D1 `szl-agents-studio-store` with `edge/migrations`, and secret names only. Wrangler
+is pinned to an exact version by `edge/package-lock.json` and installed with `npm ci`.
+
+What the workflow does:
+
+1. `store/verify`, on every pull request and push that touches the store: the Worker
+   contracts (`node --test`), the deploy-configuration and readback contracts (Python
+   standard library only) and a credential-free `wrangler deploy --dry-run` that must
+   upload exactly the committed `store.mjs`, byte for byte.
+2. `store/deploy`, only for `main` (push or **Run workflow**) and only while the
+   repository variable `SZL_STORE_DEPLOY_ENABLED` is `1`. It waits for the
+   `cloudflare-production` environment's reviewers, prints the D1 Time Travel bookmark
+   (the restore point), runs `wrangler d1 migrations apply DB --remote`, then
+   `wrangler deploy --var SOURCE_REVISION:<full github.sha> --message <sha>`. Last,
+   `store_deploy_readback.py` fails the job unless
+   `https://agents-store.a-11-oy.com/healthz` declares that exact SHA with the D1
+   binding and both required secrets configured. On push, `--strict` refuses to
+   overwrite a Worker that was last changed outside Wrangler (dashboard or API); a
+   manually dispatched run may reconcile it.
+
+Owner setup, once:
+
+1. Cloudflare dashboard, **Account API tokens**, create a custom token limited to this
+   one account with exactly these account permissions: **Workers Scripts: Edit**,
+   **D1: Edit** (bookmark and migrations) and **Account Settings: Read**. No zone
+   permissions: the Custom Domain `agents-store.a-11-oy.com` stays attached outside
+   `wrangler.toml`, and deploys neither change nor remove it. Optionally restrict client
+   IP ranges and set an expiry.
+2. GitHub, **Settings > Environments**, create `cloudflare-production` with yourself as
+   required reviewer and deployment branches limited to `main`. Add the environment
+   secrets `CLOUDFLARE_API_TOKEN` (the token above) and `CLOUDFLARE_ACCOUNT_ID`.
+3. Leave the Worker secrets where they are. Set or rotate them only from `hosted/edge`
+   with `npx wrangler secret put <NAME>`: `STORE_SECRET` and `ADMISSION_SECRET` are
+   required (a deploy refuses to run without them), `METRICS_SECRET` is optional, and
+   `SNOWFLAKE_DISPATCH_SECRET` stays unset.
+4. Keep `agents-store.a-11-oy.com/healthz` free of Monetization Gateway charges and bot
+   challenges. Otherwise the readback fails with "edge returned 402 (x402 paywall)" or
+   "403 managed challenge".
+5. GitHub, **Settings > Secrets and variables > Actions > Variables**, set
+   `SZL_STORE_DEPLOY_ENABLED` to `1`.
+6. Run the first deployment from **Actions > Hosted store deploy > Run workflow** on
+   `main`; a push-triggered first run stops at `--strict` because the current Worker
+   was last uploaded through the API. That first run replaces the manually uploaded
+   source of commit `d739c95b` with `main`, sets `SOURCE_REVISION` to the full SHA (until
+   then receipts record `UNKNOWN`), applies `0004_snowflake_dispatch_hold.sql` (empty
+   hold tables; 0002 and 0003 are idempotent if already present), keeps workers.dev
+   enabled, turns preview URLs off and sets `REQUIRE_MODEL_BINDING` to `1`. That live
+   variable's value could not be read back for this change: confirm it before approving.
+
+Local check without credentials:
+
+```powershell
+cd hosted\edge
+npm ci --ignore-scripts
+npx --no-install wrangler deploy --dry-run --outdir $env:TEMP\store-dry-run
+```
+
+Rollback: `npx wrangler rollback` restores the previous Worker version together with
+its own `SOURCE_REVISION`; then revert the change on `main` so the next deploy agrees.
+`npx wrangler d1 time-travel restore DB --bookmark=<bookmark from the run log>` rewinds
+D1 and discards every write after that point, so use it deliberately.
+
+Proof boundary: `/healthz` is the Worker's own DECLARED statement. A matching readback
+shows that the Custom Domain serves a version carrying the deployed `SOURCE_REVISION`;
+it is not independent attestation of the running code, storage readiness or model
+behaviour. The SQL contracts run on SQLite stand-ins, not on D1.
+
 ## Release
 
 1. Review, sign and push the smallest source change through the ordinary PR path.
@@ -201,7 +279,8 @@ attestation, a model-quality evaluation or a release.
 3. Run `python hosted/prepare_space.py --revision <main-sha> --output <fresh-path>`.
    The exporter reads committed allowlisted blobs, not private working files.
 4. Verify the approved account's Worker access, plan and resource collision checks.
-   Publish the dedicated store and schema; configure both secrets without logs.
+   Publish the dedicated store through [Deploy](#deploy) and read back its exact
+   revision; configure secrets only with `wrangler secret put`, never through CI or logs.
 5. Publish only the exported directory to the dedicated `SZLHOLDINGS` Space.
    Read back all blobs, the Space revision and application source identity.
 6. Verify real login, cross-account isolation, persistence across restart,
