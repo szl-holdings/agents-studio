@@ -144,8 +144,12 @@ node --check static/studio.js
 
 CI (`.github/workflows/hosted.yml`, Ubuntu, Python 3.12.10) runs the same three
 commands after installing the hash-locked `requirements/ci/hosted-contract.txt`,
-which is compiled from this directory's `requirements.txt`. The job fails if the
-two disagree; regenerate the lock with the command in `requirements/ci/hosted-contract.in`.
+which is compiled from this directory's `requirements.txt`. The job fails if a
+line in `requirements.txt` is not an exact `==` pin or names a version the lock
+did not install; regenerate the lock with the command in
+`requirements/ci/hosted-contract.in`. It does not detect a dependency removed
+from `requirements.txt` but still in the lock; the `hosted-image` job installs
+`requirements.txt` itself.
 
 Tests use synthetic identities, an in-memory SQLite D1 adapter, and injected
 model outputs. They do not establish successful OAuth, provider deployment,
