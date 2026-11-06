@@ -17,6 +17,23 @@ workflow artifacts. The log contains no request ID, Snowflake query ID, exact
 metrics payload, or payload digest. No Snowflake destination readback was
 performed for this source repair.
 
+That run was the last of three scheduled attempts. The Actions API lists exactly
+three runs of this workflow, all at the same source and all failing the same way:
+
+| Run | Export step began (UTC) | `snowflake_write_uncertain` printed (UTC) |
+|---|---|---|
+| [40991734123](https://github.com/szl-holdings/agents-studio/actions/runs/40991734123) | 2026-10-30 02:27:15 | 02:27:18 |
+| [41159708453](https://github.com/szl-holdings/agents-studio/actions/runs/41159708453) | 2026-10-31 02:22:50 | 02:22:54 |
+| [41265043609](https://github.com/szl-holdings/agents-studio/actions/runs/41265043609) | 2026-11-01 02:24:30 | 02:24:34 |
+
+Like the cited run, neither earlier run retained workflow artifacts, and neither
+log contains a request ID, query ID, metrics payload or payload digest. At that
+source the exporter returns before the Snowflake boundary when the metrics
+response has no days, so this message means each attempt fetched at least one
+day and then entered the boundary below. The API reports the workflow as `disabled_manually`
+(record last updated 2026-11-01 02:34 UTC). Treat each attempt as a separate
+**UNKNOWN** outcome.
+
 The exception boundary covers connection establishment, cursor creation,
 MERGE execution, and both cleanup calls. With autocommit enabled, even a cleanup
 failure after a successful MERGE produces this message. The message therefore
@@ -38,9 +55,9 @@ Do not rerun this historical job, call the injectable exporter with a real
 connector, or reconstruct and replay its payload from today's metrics endpoint.
 The endpoint uses a moving window, and missing days are omitted. Retain the run
 log and any existing operator/provider evidence in their approved private
-custody. Inspect subsequent scheduled runs separately; do not assume the cited
-run was the only attempt. This change does not change live account settings or
-cancel queued jobs.
+custody. Reconcile each of the three attempts above separately; do not assume
+one attempt's evidence covers another. This change does not change live account
+settings or cancel queued jobs.
 
 Use an already authorized read-only Snowflake session and existing bounded
 compute controls. These are proposed read-only queries, not evidence that they
@@ -72,6 +89,8 @@ actual account and object identity; names alone do not establish custody.
    LIMIT 100;
    ```
 
+   Run it once per attempt: repeat it with the bounds set to 02:20 and 02:30
+   UTC on 2026-10-30 and on 2026-10-31.
    Hitting the result limit requires a narrower interval, not a completeness
    claim. Account Usage query history has documented retention and latency
    limits; absent or inaccessible history is not proof of non-dispatch. See
@@ -79,7 +98,11 @@ actual account and object identity; names alone do not establish custody.
 
 2. Read destination rows for the intended historical source/window, using the
    query below. The eligible window was 2026-10-02 through 2026-10-31 inclusive;
-   the exact subset and counts sent are not preserved in the Actions log.
+   the exact subset and counts sent are not preserved in the Actions log. The
+   same source accepted days from the run date minus 30 through the run date
+   minus 1. The earlier attempts' windows were therefore 2026-09-30 through
+   2026-10-29 and 2026-10-01 through 2026-10-30. To cover all three, run the
+   query with the lower bound `METRIC_DAY >= '2026-09-30'::DATE`.
 
    ```sql
    SELECT METRIC_DAY, SOURCE_REVISION, SCHEMA_VERSION, IDEMPOTENCY_KEY,
@@ -143,6 +166,6 @@ retained on the same local disk. The D1 migration, authenticated hold endpoint,
 first-response-only dispatch adapter and read-only reconciliation function now
 encode the required no-resend control in source. They are not invoked by the
 blocked operator and have not been migrated, configured or observed live. The
-historical attempt predates their request-bound payload record and remains
+three historical attempts predate their request-bound payload record and remain
 UNKNOWN. No production custody, provider idempotency, successful export,
 independent approval or live account change is claimed.
