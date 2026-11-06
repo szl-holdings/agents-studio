@@ -142,6 +142,11 @@ node --test tests/test_store.mjs tests/test_studio_ui.mjs
 node --check static/studio.js
 ```
 
+CI (`.github/workflows/hosted.yml`, Ubuntu, Python 3.12.10) runs the same three
+commands after installing the hash-locked `requirements/ci/hosted-contract.txt`,
+which is compiled from this directory's `requirements.txt`. The job fails if the
+two disagree; regenerate the lock with the command in `requirements/ci/hosted-contract.in`.
+
 Tests use synthetic identities, an in-memory SQLite D1 adapter, and injected
 model outputs. They do not establish successful OAuth, provider deployment,
 durability across restart, or model quality. The original root offline suites
