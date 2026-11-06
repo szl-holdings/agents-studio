@@ -33,7 +33,7 @@ once the owner enables it, it publishes only the hosted storage Worker from `mai
 | `session_lock.py`, `session_control.py`, `session_recovery.py` | Shared profile lock, cancellation channel and bounded provider readback |
 | `cloud_connection.py` | Read-only **Check connection** observation of the hosted router control Space |
 | `tests/` | Offline contracts for the local application ([Local verification](#local-verification)) |
-| `.github/workflows/` | `ci.yml`: Windows contracts. `hosted.yml`: hosted contracts and container smoke. `snowflake-metrics.yml`: deliberate fail-closed Snowflake hold ([hosted/SNOWFLAKE_RECONCILIATION.md](hosted/SNOWFLAKE_RECONCILIATION.md)) |
+| `.github/workflows/` | `ci.yml`: Windows contracts. `hosted.yml`: hosted contracts and container smoke. `snowflake-metrics.yml`: deliberate fail-closed Snowflake hold ([hosted/SNOWFLAKE_RECONCILIATION.md](hosted/SNOWFLAKE_RECONCILIATION.md)). `hosted-deploy.yml`: store Worker contracts and credential-free dry run, then the opt-in, reviewer-gated store deploy ([hosted/README.md](hosted/README.md#deploy)) |
 | `hosted/` | Separate public Hugging Face Space application with its own tests; see [hosted/README.md](hosted/README.md). Published copy: [SZLHOLDINGS/agents-studio](https://huggingface.co/spaces/SZLHOLDINGS/agents-studio) |
 
 ## Agents Studio
