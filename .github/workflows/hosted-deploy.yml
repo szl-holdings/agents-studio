@@ -2,8 +2,9 @@ name: Hosted store deploy
 
 # Deploys hosted/edge/store.mjs to the Cloudflare Worker "szl-agents-studio-store".
 # Control before action: Worker and deploy-contract tests, a credential-free dry
-# run, an opt-in repository variable, the cloudflare-production environment's
-# reviewers and Wrangler's required-secret check all precede any remote change.
+# run, an opt-in repository variable and the cloudflare-production environment's
+# reviewers precede any remote change. Wrangler's required-secret check runs in
+# the deploy step, after the additive D1 migrations and before the Worker upload.
 # Evidence after: the job fails unless the live /healthz declares this exact
 # 40-character commit SHA. Owner setup: hosted/README.md#deploy.
 
@@ -132,8 +133,9 @@ jobs:
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           workingDirectory: hosted/edge
           command: d1 migrations apply DB --remote
-      # On push, --strict refuses to overwrite a Worker last changed outside
-      # Wrangler (dashboard or API). A manually dispatched run may reconcile it.
+      # On push, --strict refuses to overwrite a Worker last deployed outside
+      # Wrangler (through the script API, or from the dashboard with conflicting
+      # settings). A manually dispatched run may reconcile it.
       - name: Deploy the Worker with the full commit SHA
         uses: cloudflare/wrangler-action@9acf94ace14e7dc412b076f2c5c20b8ce93c79cd # v3.15.0
         env:

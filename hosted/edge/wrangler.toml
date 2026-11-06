@@ -21,15 +21,18 @@ find_additional_modules = false
 # The workers.dev origin remains an accepted STORE_URL (hosted/README.md) and was
 # the store origin before the Custom Domain existed, so it stays enabled; its
 # current live setting was not read back for this file. Preview URLs would expose
-# every uploaded version against the production database; keep them off. The Custom Domain agents-store.a-11-oy.com is attached to this Worker
-# outside this file: no `routes` key means `wrangler deploy` neither changes nor
-# removes it, and the deploy token needs no zone permission. The post-deploy
-# readback goes through that Custom Domain, so a detached domain fails the job.
+# every uploaded version against the production database; keep them off. The
+# Custom Domain agents-store.a-11-oy.com is attached to this Worker outside this
+# file: no `routes` key means `wrangler deploy` neither changes nor removes it, and
+# the deploy token needs no zone permission. The post-deploy readback goes through
+# that Custom Domain, so a detached domain fails the job.
 workers_dev = true
 preview_urls = false
 
 # Invocation logs could record request headers, including the store bearer
 # credential. Logs and traces stay off until a redacting configuration is reviewed.
+# Every deploy uploads this setting, so it also turns off observability that was
+# enabled outside this file (dashboard or API).
 [observability]
 enabled = false
 

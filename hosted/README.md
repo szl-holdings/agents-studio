@@ -231,8 +231,9 @@ What the workflow does:
    `store_deploy_readback.py` fails the job unless
    `https://agents-store.a-11-oy.com/healthz` declares that exact SHA with the D1
    binding and both required secrets configured. On push, `--strict` refuses to
-   overwrite a Worker that was last changed outside Wrangler (dashboard or API); a
-   manually dispatched run may reconcile it.
+   overwrite a Worker that was last deployed outside Wrangler (through the script
+   API, or from the dashboard with conflicting settings); a manually dispatched run
+   may reconcile it.
 
 Owner setup, once:
 
@@ -247,7 +248,8 @@ Owner setup, once:
    secrets `CLOUDFLARE_API_TOKEN` (the token above) and `CLOUDFLARE_ACCOUNT_ID`.
 3. Leave the Worker secrets where they are. Set or rotate them only from `hosted/edge`
    with `npx wrangler secret put <NAME>`: `STORE_SECRET` and `ADMISSION_SECRET` are
-   required (a deploy refuses to run without them), `METRICS_SECRET` is optional, and
+   required (`wrangler deploy` refuses to upload without them; the migrations step
+   before it does not check), `METRICS_SECRET` is optional, and
    `SNOWFLAKE_DISPATCH_SECRET` stays unset.
 4. Keep `agents-store.a-11-oy.com/healthz` free of Monetization Gateway charges and bot
    challenges. Otherwise the readback fails with "edge returned 402 (x402 paywall)" or
@@ -259,9 +261,13 @@ Owner setup, once:
    was last uploaded through the API. That first run replaces the manually uploaded
    source of commit `d739c95b` with `main`, sets `SOURCE_REVISION` to the full SHA (until
    then receipts record `UNKNOWN`), applies `0004_snowflake_dispatch_hold.sql` (empty
-   hold tables; 0002 and 0003 are idempotent if already present), keeps workers.dev
-   enabled, turns preview URLs off and sets `REQUIRE_MODEL_BINDING` to `1`. That live
-   variable's value could not be read back for this change: confirm it before approving.
+   hold tables; 0002 and 0003 are idempotent if already present), leaves workers.dev
+   enabled, turns preview URLs off, turns Workers observability (logs and traces) off
+   and sets `REQUIRE_MODEL_BINDING` to `1`. The live values of that variable, of
+   workers.dev and preview URLs, and of observability could not be read back for this
+   change: confirm them before approving. The account audit log shows an API-token
+   settings patch of this Worker at 2026-11-06 15:27:38Z, reported by another automated
+   actor as enabling observability; the first run reverses it.
 
 Local check without credentials:
 
