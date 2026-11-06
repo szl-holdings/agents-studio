@@ -1,0 +1,7 @@
+# Web dependencies for the hosted-contract job in .github/workflows/hosted.yml.
+# The direct pins come from hosted/requirements.txt (the Space runtime pins), so
+# CI tests the versions the Space installs. The workflow fails if the installed
+# versions differ from those pins (step "Verify the lock matches the Space runtime pins").
+# Regenerate the hash-locked file after editing either file:
+#   uv pip compile --generate-hashes --python-version 3.12 requirements/ci/hosted-contract.in -o requirements/ci/hosted-contract.txt
+-r ../../hosted/requirements.txt
