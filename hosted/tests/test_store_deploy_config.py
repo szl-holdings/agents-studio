@@ -19,8 +19,9 @@ CONFIG = tomllib.loads((EDGE / "wrangler.toml").read_text(encoding="utf-8"))
 LIVE_DATABASE_ID = "27edfa50-be82-4fa1-b0c8-0c630c7db3ea"
 LIVE_COMPATIBILITY_DATE = "2026-10-01"
 REQUIRED_SECRETS = ["STORE_SECRET", "ADMISSION_SECRET"]
-# Read by store.mjs but intentionally left unset in production: each one keeps an
-# optional endpoint disabled until a separately reviewed change admits it.
+# Read by store.mjs but not declared in wrangler.toml: each one only enables an
+# optional endpoint. METRICS_SECRET is set on the live Worker and every deploy keeps
+# it; the Snowflake dispatch pair stays unset until a separately reviewed change admits it.
 OPTIONAL_UNSET = {"METRICS_SECRET", "SNOWFLAKE_DISPATCH_SECRET", "SNOWFLAKE_EXPORTER_REVISION"}
 ADDITIVE_STATEMENT = re.compile(
     r"(CREATE TABLE IF NOT EXISTS|CREATE (UNIQUE )?INDEX IF NOT EXISTS|INSERT OR IGNORE INTO)\s")
