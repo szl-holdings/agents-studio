@@ -2,8 +2,10 @@
 
 Private source: [szl-holdings/agents-studio](https://github.com/szl-holdings/agents-studio).
 The GitHub workflow runs offline Windows contracts with synthetic credentials.
-Source publication and green CI do not enable hosted inference. Only the opt-in,
-reviewer-gated `Hosted store deploy` workflow publishes the hosted storage Worker
+Source publication and green CI do not deploy or enable hosted inference.
+
+The one exception is the opt-in, reviewer-gated `Hosted store deploy` workflow:
+once the owner enables it, it publishes only the hosted storage Worker from `main`
 ([hosted/README.md](hosted/README.md#deploy)).
 
 <!-- szl:header v1 -->
