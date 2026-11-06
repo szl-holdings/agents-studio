@@ -57,8 +57,8 @@ jobs:
       - name: Auth and orchestration contracts
         working-directory: hosted
         run: python -B -m unittest discover -s tests -p 'test_*.py' -v
-      - name: Store SQL, isolation and quota contracts
-        run: node --test hosted/tests/test_store.mjs
+      - name: Store SQL, isolation, quota and browser UI contracts
+        run: node --test hosted/tests/test_store.mjs hosted/tests/test_studio_ui.mjs
       - name: Browser JavaScript syntax
         run: node --check hosted/static/studio.js
       - name: Patch hygiene
