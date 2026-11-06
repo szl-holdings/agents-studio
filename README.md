@@ -1,7 +1,9 @@
 # OpenAI Agents API curl application
 
 Private source: [szl-holdings/agents-studio](https://github.com/szl-holdings/agents-studio).
-The GitHub workflow runs offline Windows contracts with synthetic credentials.
+CI runs offline contracts with synthetic credentials: `ci.yml` on Windows for the
+local application, and `hosted.yml` on Linux for `hosted/` plus a container smoke
+test without provider access ([Repository layout](#repository-layout)).
 Source publication and green CI do not deploy or enable hosted inference.
 
 The one exception is the opt-in, reviewer-gated `Hosted store deploy` workflow:
@@ -20,6 +22,19 @@ once the owner enables it, it publishes only the hosted storage Worker from `mai
 
 [Product](https://a-11-oy.com) · [Proof](https://a11oy.net) · [GitHub organization](https://github.com/szl-holdings)
 <!-- /szl:header -->
+
+## Repository layout
+
+| Path | Purpose |
+|---|---|
+| `Start-Agents.cmd`, `Launch-Studio.ps1`, `studio.py`, `studio/` | Local loopback browser workspace ([Agents Studio](#agents-studio)) |
+| `new_agent.json`, `new_agent.py`, `run-new-agent.ps1` | Original [New agent](#original-new-agent-profile) profile and its launcher |
+| `agent.json`, `app.py`, `run.ps1` | [SZL Estate Evidence Scout](#szl-estate-evidence-scout-profile) CLI; `app.py` is also the shared curl transport |
+| `session_lock.py`, `session_control.py`, `session_recovery.py` | Shared profile lock, cancellation channel and bounded provider readback |
+| `cloud_connection.py` | Read-only **Check connection** observation of the hosted router control Space |
+| `tests/` | Offline contracts for the local application ([Local verification](#local-verification)) |
+| `.github/workflows/` | `ci.yml`: Windows contracts. `hosted.yml`: hosted contracts and container smoke. `snowflake-metrics.yml`: deliberate fail-closed Snowflake hold ([hosted/SNOWFLAKE_RECONCILIATION.md](hosted/SNOWFLAKE_RECONCILIATION.md)) |
+| `hosted/` | Separate public Hugging Face Space application with its own tests; see [hosted/README.md](hosted/README.md). Published copy: [SZLHOLDINGS/agents-studio](https://huggingface.co/spaces/SZLHOLDINGS/agents-studio) |
 
 ## Agents Studio
 
@@ -315,6 +330,11 @@ pwsh.exe -NoProfile -File tests\test_run_new_agent.ps1
 ```
 
 The local tests use an HTTP stand-in and a real `curl.exe`; no OpenAI key is needed. A live session requires a project key and access to the saved agent. Local tests do not establish that a live session ran or that its estate findings are complete.
+
+On Linux the same Python suite runs with `python3 -m unittest discover -s tests -v`
+and the system `curl`; CI runs it on Windows. The PowerShell launcher contracts
+need Windows PowerShell or `pwsh`. The hosted Space application has separate
+offline suites; see [hosted/README.md](hosted/README.md#verification).
 
 Historical live-start and follow-up records remain private to the original
 workstation and are not part of the repository or its CI evidence.

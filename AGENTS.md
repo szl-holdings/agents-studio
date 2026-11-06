@@ -31,6 +31,20 @@ pwsh.exe -NoProfile -File tests/test_run_new_agent.ps1
 node --check studio/studio.js
 ```
 
+Changes under `hosted/` also need the hosted suites (`hosted.yml` runs them in
+CI). In a virtual environment, from the repository root:
+
+```bash
+python -m pip install --require-hashes -r requirements/ci/hosted-contract.txt
+cd hosted
+python -B -m unittest discover -s tests -p 'test_*.py' -v
+node --test tests/test_store.mjs tests/test_studio_ui.mjs
+node --check static/studio.js
+```
+
+If `hosted/requirements.txt` changes, regenerate the hash-locked CI file with
+the command in `requirements/ci/hosted-contract.in`.
+
 The tests use local stand-ins and synthetic credentials. A live provider call
 is a separate explicit operation; test CI must not receive production credentials.
 The one exception is the opt-in `store/deploy` job in
