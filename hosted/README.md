@@ -98,7 +98,7 @@ test hook and overrode the disabled-service declaration. A concurrency group
 prevented overlap but supplied no durable uncertainty hold between runs. This
 source repair closes that bypass; it does not reconcile a previous write or
 make the export operational. See [Snowflake reconciliation and admission](SNOWFLAKE_RECONCILIATION.md)
-for the historical unknown outcome, bounded readback procedure, and evidence
+for the three historical unknown outcomes, bounded readback procedure, and evidence
 required before a separately reviewed production adapter can be admitted.
 
 `snowflake_durable_dispatch.py` now contains the offline-qualified boundary for
@@ -119,8 +119,8 @@ compares destination rows with the held payload. It issues only bounded `SELECT`
 statements, hashes query IDs in its returned report, never changes the hold, and
 always returns `resend_permitted: false`. A matching observation is evidence for
 operator review; it is not an automatic release or permission to send the next
-window. The historical 2026-11-01 attempt lacks this request-bound record and
-remains UNKNOWN.
+window. The three historical attempts (2026-10-30, 2026-10-31 and 2026-11-01)
+lack this request-bound record and remain UNKNOWN.
 
 These components are source preparation only. The scheduled operator remains
 hard-blocked before credentials, metrics, D1 reservation, connector import or
@@ -141,6 +141,15 @@ timeout is best effort; it is not a hard execution deadline or SLA.
 node --test tests/test_store.mjs tests/test_studio_ui.mjs
 node --check static/studio.js
 ```
+
+CI (`.github/workflows/hosted.yml`, Ubuntu, Python 3.12.10) runs the same three
+commands after installing the hash-locked `requirements/ci/hosted-contract.txt`,
+which is compiled from this directory's `requirements.txt`. The job fails if a
+line in `requirements.txt` is not an exact `==` pin or names a version the lock
+did not install; regenerate the lock with the command in
+`requirements/ci/hosted-contract.in`. It does not detect a dependency removed
+from `requirements.txt` but still in the lock; the `hosted-image` job installs
+`requirements.txt` itself.
 
 Tests use synthetic identities, an in-memory SQLite D1 adapter, and injected
 model outputs. They do not establish successful OAuth, provider deployment,

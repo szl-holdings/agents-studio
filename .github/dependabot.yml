@@ -1,0 +1,43 @@
+version: 2
+updates:
+  # SHA-pinned actions in .github/workflows/*.yml.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "America/New_York"
+    labels:
+      - "dependencies"
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # Hash-locked CI install (requirements/ci/*.txt, compiled with uv --generate-hashes).
+  # The direct pins come from hosted/requirements.txt; hosted.yml fails if the two drift.
+  # The Space runtime pins in /hosted stay on Dependabot security updates: each change
+  # there is a deployed file that ships only through the release steps in hosted/README.md.
+  - package-ecosystem: "pip"
+    directory: "/requirements/ci"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "08:00"
+      timezone: "America/New_York"
+    labels:
+      - "dependencies"
+    open-pull-requests-limit: 5
+    groups:
+      pip-ci:
+        patterns:
+          - "*"
+    ignore:
+      # Direct pins live in hosted/requirements.txt (included by hosted-contract.in).
+      # Change them there, then regenerate the lock; this entry updates transitive pins.
+      - dependency-name: "flask"
+      - dependency-name: "authlib"
+      - dependency-name: "requests"
+      - dependency-name: "gunicorn"
