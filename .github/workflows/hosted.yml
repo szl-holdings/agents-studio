@@ -18,19 +18,47 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12.10'
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
-      - name: Install web dependencies only
-        run: python -m pip install -r hosted/requirements.txt
+      - name: Install web dependencies only (hash-locked)
+        run: python -m pip install --disable-pip-version-check --require-hashes -r requirements/ci/hosted-contract.txt
+      - name: Verify the lock matches the Space runtime pins
+        # Fails if hosted/requirements.txt pins a version the hashed lock did not install.
+        run: |
+          python - <<'PY'
+          import re
+          from importlib.metadata import PackageNotFoundError, version
+          from pathlib import Path
+
+          drift = []
+          for raw in Path("hosted/requirements.txt").read_text(encoding="utf-8").splitlines():
+              line = raw.split("#", 1)[0].strip()
+              if not line:
+                  continue
+              match = re.fullmatch(r"([A-Za-z0-9][A-Za-z0-9._-]*)==(\S+)", line)
+              if match is None:
+                  raise SystemExit(f"hosted/requirements.txt must use exact pins: {line!r}")
+              name, pinned = match.groups()
+              try:
+                  installed = version(name)
+              except PackageNotFoundError:
+                  installed = "missing"
+              if installed != pinned:
+                  drift.append(f"{name}: pinned {pinned}, installed {installed}")
+          if drift:
+              raise SystemExit("Regenerate requirements/ci/hosted-contract.txt (command in its .in): "
+                               + "; ".join(drift))
+          print("hosted CI lock matches hosted/requirements.txt pins")
+          PY
       - name: Auth and orchestration contracts
         working-directory: hosted
         run: python -B -m unittest discover -s tests -p 'test_*.py' -v
-      - name: Store SQL, isolation and quota contracts
-        run: node --test hosted/tests/test_store.mjs
+      - name: Store SQL, isolation, quota and browser UI contracts
+        run: node --test hosted/tests/test_store.mjs hosted/tests/test_studio_ui.mjs
       - name: Browser JavaScript syntax
         run: node --check hosted/static/studio.js
       - name: Patch hygiene
