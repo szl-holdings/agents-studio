@@ -46,6 +46,10 @@ If `hosted/requirements.txt` changes, regenerate the hash-locked CI file with
 the command in `requirements/ci/hosted-contract.in`.
 
 The tests use local stand-ins and synthetic credentials. A live provider call
-is a separate explicit operation; CI must not receive production credentials.
+is a separate explicit operation; test CI must not receive production credentials.
+The one exception is the opt-in `store/deploy` job in
+`.github/workflows/hosted-deploy.yml`: it receives a Workers-scoped Cloudflare token
+only from the reviewer-protected `cloudflare-production` environment and must read
+back the exact deployed revision (`hosted/README.md#deploy`).
 Browser checks and source-bound local release records are separate evidence,
 not proof that a remote deployment or model evaluation succeeded.

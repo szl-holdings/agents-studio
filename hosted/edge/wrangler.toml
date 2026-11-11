@@ -1,0 +1,67 @@
+# Cloudflare Worker "szl-agents-studio-store": the dedicated D1 store behind the
+# hosted Agents Studio Space. This file is the reviewed source of truth for the
+# Worker's code, compatibility date, plain variables and D1 binding. It contains
+# no secret values and no account identifier; CI supplies CLOUDFLARE_ACCOUNT_ID
+# and CLOUDFLARE_API_TOKEN from the "cloudflare-production" GitHub environment.
+# Deployment is .github/workflows/hosted-deploy.yml; see hosted/README.md#deploy.
+
+name = "szl-agents-studio-store"
+main = "store.mjs"
+# Live Worker compatibility date, read back from the account on 2026-11-06.
+# Change it only in a reviewed PR whose tests cover the newer runtime behaviour.
+compatibility_date = "2026-10-01"
+
+# Upload store.mjs byte-for-byte as the only module, so the deployed module can be
+# compared with the git blob of the reported SOURCE_REVISION. With no_bundle,
+# Wrangler would otherwise attach every *.sql/*.wasm/*.txt file below this
+# directory (schema, migrations, node_modules) as extra modules.
+no_bundle = true
+find_additional_modules = false
+
+# The workers.dev origin remains an accepted STORE_URL (hosted/README.md) and was
+# the store origin before the Custom Domain existed, so it stays enabled; its
+# current live setting was not read back for this file. Preview URLs would expose
+# every uploaded version against the production database; keep them off. The
+# Custom Domain agents-store.a-11-oy.com is attached to this Worker outside this
+# file: no `routes` key means `wrangler deploy` neither changes nor removes it, and
+# the deploy token needs no zone permission. The post-deploy readback goes through
+# that Custom Domain, so a detached domain fails the job.
+workers_dev = true
+preview_urls = false
+
+# Invocation logs could record request headers, including the store bearer
+# credential. Logs and traces stay off until a redacting configuration is reviewed.
+# Every deploy uploads this setting, so it also turns off observability that was
+# enabled outside this file (dashboard or API).
+[observability]
+enabled = false
+
+[vars]
+# Only the exact string "1" enforces declared model pins on reservation. The
+# Space treats the store as ready only when `check` reports
+# model_binding_enforced: true (hosted/app.py), so production runs with "1".
+REQUIRE_MODEL_BINDING = "1"
+# Honest placeholder for local or manual runs. The deploy workflow replaces it
+# with the full 40-character commit SHA (`wrangler deploy --var SOURCE_REVISION:<sha>`).
+# store.mjs reports any value other than 40 lowercase hex characters as UNKNOWN.
+SOURCE_REVISION = "UNKNOWN"
+
+# Secrets are names only here. Set values once with `npx wrangler secret put <NAME>`;
+# never commit them, never pass them through CI. `wrangler deploy` keeps existing
+# secrets and refuses to deploy while a required one is missing.
+#   STORE_SECRET              required: bearer for POST /v1/store
+#   ADMISSION_SECRET          required: day-bound admission key, distinct from STORE_SECRET
+#   METRICS_SECRET            optional: enables GET /v1/metrics; unset keeps it disabled
+#   SNOWFLAKE_DISPATCH_SECRET not configured: POST /v1/snowflake-dispatch stays disabled
+# SNOWFLAKE_EXPORTER_REVISION is a plain variable admitted only by a separate reviewed
+# change; adding it in the dashboard would be removed by the next deploy.
+[secrets]
+required = ["STORE_SECRET", "ADMISSION_SECRET"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "szl-agents-studio-store"
+database_id = "27edfa50-be82-4fa1-b0c8-0c630c7db3ea"
+# Additive, idempotent migrations (CREATE ... IF NOT EXISTS / INSERT OR IGNORE).
+# A brand-new database needs schema.sql first; see hosted/README.md.
+migrations_dir = "migrations"
