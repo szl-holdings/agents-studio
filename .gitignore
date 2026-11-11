@@ -21,3 +21,7 @@ outputs/
 LIVE_RUN.md
 *_LIVE_RUN.md
 OCT*.json
+node_modules/
+.wrangler/
+.dev.vars
+.dev.vars.*
