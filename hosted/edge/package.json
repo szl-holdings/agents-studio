@@ -1,0 +1,12 @@
+{
+  "name": "szl-agents-studio-store",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pinned deploy tooling for the szl-agents-studio-store Cloudflare Worker (store.mjs).",
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "wrangler": "4.160.0"
+  }
+}

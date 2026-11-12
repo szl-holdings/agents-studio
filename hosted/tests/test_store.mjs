@@ -161,6 +161,24 @@ test("health is a read-only declaration, not database readiness", async (t) => {
   assert.equal(response.headers.get("cache-control"), "no-store");
 });
 
+test("health and receipts declare only a full lowercase commit SHA as the source revision", async (t) => {
+  // The manually deployed Worker carried SOURCE_REVISION=d739c95b; the deploy
+  // workflow injects the full github.sha that its readback compares exactly.
+  for (const [configured, declared] of [["d739c95b", "UNKNOWN"], ["C".repeat(40), "UNKNOWN"],
+    [`${"c".repeat(40)}\n`, "UNKNOWN"], [undefined, "UNKNOWN"], ["UNKNOWN", "UNKNOWN"],
+    ["c".repeat(40), "c".repeat(40)]]) {
+    const env = { ...environment(t), SOURCE_REVISION: configured };
+    const response = await worker.fetch(new Request("https://store.example/healthz"), env);
+    assert.equal((await response.json()).source_revision, declared);
+    await conversation(env);
+    assert.equal(env.DB.sqlite.prepare("SELECT source_revision FROM receipts").get().source_revision,
+      declared);
+  }
+  const env = environment(t);
+  const queried = await worker.fetch(new Request("https://store.example/healthz?revision=1"), env);
+  assert.equal(queried.status, 404);
+});
+
 test("metrics expose only recent owner-free admission counters under an independent credential", async (t) => {
   const env = { ...environment(t), METRICS_SECRET };
   const now = new Date();
