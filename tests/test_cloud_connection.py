@@ -175,6 +175,13 @@ class CloudWorkerTests(unittest.TestCase):
             self.assertEqual(result["control"]["state"], "UNAVAILABLE")
             observer.check()
             self.assertEqual(calls, ["/api/source"])
+            # Event.wait can return before the monotonic deadline. Keep the
+            # stuck read held until that deadline, or the worker may still
+            # open the next path.
+            while time.monotonic() < observer.cycle.deadline:
+                remaining = observer.cycle.deadline - time.monotonic()
+                if remaining > 0:
+                    time.sleep(remaining)
         finally:
             gate.set()
             observer.cycle.done.wait(2)
