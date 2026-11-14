@@ -347,3 +347,5 @@ workstation and are not part of the repository or its CI evidence.
 - [Configuring and reusing agents](https://developers.openai.com/api/docs/guides/agents-api/configuration)
 - [Running and continuing sessions](https://developers.openai.com/api/docs/guides/agents-api/sessions)
 - [Session events and items](https://developers.openai.com/api/docs/guides/agents-api/sessions/events)
+
+Estate on Hugging Face: models, datasets and Spaces are published under the [SZLHOLDINGS](https://huggingface.co/SZLHOLDINGS) org.

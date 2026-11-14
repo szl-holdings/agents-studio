@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agents-studio"
+version = "0.1.0"
+description = "Local SZL Agents Studio: curl-backed agent sessions, read-only cloud control observation, and explicit recovery boundaries."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+authors = [{ name = "Stephen Lutar", email = "stephen@szlholdings.com" }]
+dependencies = []
+
+[project.urls]
+Homepage = "https://huggingface.co/spaces/SZLHOLDINGS/agents-studio"
+Repository = "https://github.com/szl-holdings/agents-studio"
+
+[tool.setuptools]
+py-modules = ["app", "cloud_connection", "new_agent", "session_control", "session_lock", "session_recovery", "studio"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["build", "dist", ".venv", "node_modules"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
