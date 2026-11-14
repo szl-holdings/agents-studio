@@ -6,7 +6,7 @@ import unittest
 from unittest import mock
 
 from snowflake_metrics_export import ExportError, MAX_RESPONSE_BYTES, METRICS_URL, export_once
-from tests.test_snowflake_metrics_export import DOCUMENT, TODAY, environment
+from test_snowflake_metrics_export import DOCUMENT, TODAY, environment
 
 
 class WireSocket:
