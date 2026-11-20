@@ -32,6 +32,7 @@ once the owner enables it, it publishes only the hosted storage Worker from `mai
 | `agent.json`, `app.py`, `run.ps1` | [SZL Estate Evidence Scout](#szl-estate-evidence-scout-profile) CLI; `app.py` is also the shared curl transport |
 | `session_lock.py`, `session_control.py`, `session_recovery.py` | Shared profile lock, cancellation channel and bounded provider readback |
 | `cloud_connection.py` | Read-only **Check connection** observation of the hosted router control Space |
+| `peer_pact.py`, `docs/PEER_PACT.md` | Offline proposer/skeptic proof pact: source pins, adversarial test declarations, dissent debt and create-only hash-linked review receipts (no deployment authority) |
 | `tests/` | Offline contracts for the local application ([Local verification](#local-verification)) |
 | `.github/workflows/` | `ci.yml`: Windows contracts. `hosted.yml`: hosted contracts and container smoke. `snowflake-metrics.yml`: deliberate fail-closed Snowflake hold ([hosted/SNOWFLAKE_RECONCILIATION.md](hosted/SNOWFLAKE_RECONCILIATION.md)). `hosted-deploy.yml`: store Worker contracts and credential-free dry run, then the opt-in, reviewer-gated store deploy ([hosted/README.md](hosted/README.md#deploy)) |
 | `hosted/` | Separate public Hugging Face Space application with its own tests; see [hosted/README.md](hosted/README.md). Published copy: [SZLHOLDINGS/agents-studio](https://huggingface.co/spaces/SZLHOLDINGS/agents-studio) |
