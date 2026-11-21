@@ -17,7 +17,7 @@ Homepage = "https://huggingface.co/spaces/SZLHOLDINGS/agents-studio"
 Repository = "https://github.com/szl-holdings/agents-studio"
 
 [tool.setuptools]
-py-modules = ["app", "cloud_connection", "new_agent", "session_control", "session_lock", "session_recovery", "studio"]
+py-modules = ["app", "cloud_connection", "new_agent", "peer_pact", "session_control", "session_lock", "session_recovery", "studio"]
 
 [tool.ruff]
 line-length = 120
