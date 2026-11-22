@@ -928,6 +928,45 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
             source = {"source_revision": "UNKNOWN"}
         return jsonify(source=source, model=engine.identity(), receipt_minted=False)
 
+    @app.get("/api/manifest")
+    def public_manifest():
+        """Public declared source contract, never a signed or readiness witness."""
+        revision = None
+        try:
+            declared = json.loads(
+                Path(__file__).with_name("source.json").read_text(encoding="utf-8")
+            )
+            if (isinstance(declared, dict)
+                    and declared.get("repository") == "szl-holdings/agents-studio"
+                    and isinstance(declared.get("revision"), str)
+                    and re.fullmatch(r"[0-9a-f]{40}", declared["revision"])):
+                revision = declared["revision"]
+        except (OSError, ValueError, TypeError):
+            pass
+        return jsonify(
+            schema="szl.agents-studio-public-manifest/v1",
+            space="SZLHOLDINGS/agents-studio",
+            source={
+                "repository": "szl-holdings/agents-studio",
+                "revision": revision,
+                "evidence_state": "DECLARED_ONLY" if revision else "UNAVAILABLE",
+            },
+            endpoints={
+                "liveness": "/healthz",
+                "authenticated_readiness": "/readyz",
+                "source": "/api/build-info",
+                "session": "/api/session",
+            },
+            readiness={
+                "state": "NOT_EVALUATED",
+                "auth": "NOT_EVALUATED",
+                "store": "NOT_EVALUATED",
+                "model": "NOT_EVALUATED",
+            },
+            receipt_minted=False,
+            signed_proof=False,
+        )
+
     @app.get("/readyz")
     def ready():
         user = current_user()

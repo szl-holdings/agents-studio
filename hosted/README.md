@@ -161,6 +161,16 @@ model outputs. They do not establish successful OAuth, provider deployment,
 durability across restart, or model quality. The original root offline suites
 must also pass before source publication.
 
+`GET /api/manifest` is a public, no-auth declaration of the service's
+fixed endpoints and the deployment's optional `source.json` repository/revision.
+A valid 40-character declared source revision is labeled `DECLARED_ONLY`,
+never independently verified or asserted equal to protected GitHub main.
+Invalid, missing or malformed declarations yield a null revision and
+`UNAVAILABLE`. All auth/store/model readiness dimensions are `NOT_EVALUATED`;
+HTTP 200 never proves serving readiness, OAuth, inference, durable storage,
+a signed receipt or a successful owner witness. This GET performs no model
+or store read and leaves signed-in `/readyz` behavior unchanged.
+
 `/healthz` is public liveness only. Without a valid signed-in session,
 `/api/session` reports storage `UNKNOWN` without probing D1, and `/readyz`
 returns 503 with the same `UNKNOWN` evidence. That anonymous 503 does not mean

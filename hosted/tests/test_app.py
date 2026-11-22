@@ -1,4 +1,5 @@
 import copy
+import json
 import io
 import socket
 import ssl
@@ -198,6 +199,58 @@ class HostedAppTests(unittest.TestCase):
     def run_request(self, key=KEY, prompt="A synthetic question"):
         return self.post("/api/runs", {"conversation_id": CONVERSATION_ID,
                                       "prompt": prompt, "idempotency_key": key})
+
+    def test_public_manifest_never_probes_private_runtime_or_admits_readiness(self):
+        with (mock.patch.object(self.engine, "identity",
+                                side_effect=AssertionError("model read forbidden")),
+              mock.patch.object(self.store, "call",
+                                side_effect=AssertionError("store read forbidden"))):
+            response = self.client.get("/api/manifest", **self.base)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["schema"], "szl.agents-studio-public-manifest/v1")
+        self.assertEqual(response.json["space"], "SZLHOLDINGS/agents-studio")
+        self.assertEqual(response.json["source"]["repository"], "szl-holdings/agents-studio")
+        self.assertEqual(response.json["source"]["evidence_state"], "UNAVAILABLE")
+        self.assertIsNone(response.json["source"]["revision"])
+        self.assertEqual(response.json["readiness"]["state"], "NOT_EVALUATED")
+        self.assertEqual(response.json["readiness"]["model"], "NOT_EVALUATED")
+        self.assertFalse(response.json["signed_proof"])
+        self.assertFalse(response.json["receipt_minted"])
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(self.engine.generations, 0)
+        self.assertEqual(self.store.calls, [])
+
+    def test_public_manifest_declared_sha_never_becomes_verified(self):
+        declaration = {"repository": "szl-holdings/agents-studio",
+                       "revision": "a" * 40, "evidence_class": "DECLARED",
+                       "private_token": "synthetic-secret"}
+        with mock.patch("app.Path") as mock_path:
+            mock_path.return_value.with_name.return_value.read_text.return_value = (
+                json.dumps(declaration)
+            )
+            response = self.client.get("/api/manifest", **self.base)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["source"]["revision"], "a" * 40)
+        self.assertEqual(response.json["source"]["evidence_state"], "DECLARED_ONLY")
+        self.assertEqual(response.json["readiness"]["state"], "NOT_EVALUATED")
+        self.assertNotIn("synthetic-secret", response.get_data(as_text=True))
+
+    def test_public_manifest_refuses_malformed_and_wrong_source_declarations(self):
+        for payload in (
+            "not-json",
+            json.dumps([]),
+            json.dumps({"repository": "another/owner", "revision": "a" * 40}),
+            json.dumps({"repository": "szl-holdings/agents-studio", "revision": "A" * 40}),
+            json.dumps({"repository": "szl-holdings/agents-studio", "revision": "a" * 39}),
+        ):
+            with self.subTest(payload=payload[:25]), mock.patch("app.Path") as mock_path:
+                mock_path.return_value.with_name.return_value.read_text.return_value = payload
+                response = self.client.get("/api/manifest", **self.base)
+                self.assertEqual(response.status_code, 200)
+                self.assertIsNone(response.json["source"]["revision"])
+                self.assertEqual(response.json["source"]["evidence_state"], "UNAVAILABLE")
+                self.assertEqual(response.json["readiness"]["state"], "NOT_EVALUATED")
 
     def test_hub_embedding_has_exact_frame_ancestor(self):
         for path in ("/", "/api/session", "/static/privacy.html"):
