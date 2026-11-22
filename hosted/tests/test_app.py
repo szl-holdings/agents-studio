@@ -252,6 +252,20 @@ class HostedAppTests(unittest.TestCase):
                 self.assertEqual(response.json["source"]["evidence_state"], "UNAVAILABLE")
                 self.assertEqual(response.json["readiness"]["state"], "NOT_EVALUATED")
 
+    def test_public_manifest_unreadable_declaration_fails_closed(self):
+        # A read error must not leak data or assert declared source identity.
+        with mock.patch("app.Path") as mock_path:
+            mock_path.return_value.with_name.return_value.read_text.side_effect = OSError(
+                "synthetic unreadable declaration"
+            )
+            response = self.client.get("/api/manifest", **self.base)
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json["source"]["revision"])
+        self.assertEqual(response.json["source"]["evidence_state"], "UNAVAILABLE")
+        self.assertEqual(response.json["readiness"]["state"], "NOT_EVALUATED")
+        self.assertNotIn("synthetic unreadable declaration", response.get_data(as_text=True))
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+
     def test_hub_embedding_has_exact_frame_ancestor(self):
         for path in ("/", "/api/session", "/static/privacy.html"):
             response = self.client.get(path, **self.base)

@@ -942,7 +942,8 @@ def create_app(config=None, *, store=None, engine=None, oauth_client=None):
                     and re.fullmatch(r"[0-9a-f]{40}", declared["revision"])):
                 revision = declared["revision"]
         except (OSError, ValueError, TypeError):
-            pass
+            # An unreadable or malformed source declaration cannot establish provenance.
+            revision = None
         return jsonify(
             schema="szl.agents-studio-public-manifest/v1",
             space="SZLHOLDINGS/agents-studio",
