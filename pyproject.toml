@@ -18,6 +18,7 @@ Repository = "https://github.com/szl-holdings/agents-studio"
 
 [tool.setuptools]
 py-modules = ["app", "cloud_connection", "new_agent", "peer_pact", "session_control", "session_lock", "session_recovery", "studio"]
+packages = ["tracing"]
 
 [tool.ruff]
 line-length = 120

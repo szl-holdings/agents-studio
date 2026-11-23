@@ -15,6 +15,7 @@ by design: spans carry payload digests, not payloads).
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from typing import Any
 
 SCHEMA = "szl.agents-studio.trace-schema/v1"
@@ -51,8 +52,15 @@ def validate_span(span: dict[str, Any]) -> None:
         raise TraceSchemaError(
             f"span.kind must be one of {SPAN_KINDS}, got {kind!r}"
         )
-    if not ISO_TS_RE.match(str(span.get("started_at") or "")):
-        raise TraceSchemaError(f"started_at must be an ISO-8601 timestamp: {span.get('started_at')!r}")
+    ts = str(span.get("started_at") or "")
+    if not ISO_TS_RE.match(ts):
+        raise TraceSchemaError(f"started_at must be an ISO-8601 timestamp: {ts!r}")
+    try:
+        datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        raise TraceSchemaError(
+            f"started_at must be a calendar-valid ISO-8601 timestamp: {ts!r}"
+        ) from None
     if not SHA256_RE.match(str(span.get("payload_sha256") or "")):
         raise TraceSchemaError("payload_sha256 must be a 64-hex sha256 of the raw payload")
     if "payload" in span:
@@ -73,10 +81,25 @@ def validate_trace(trace: list[dict[str, Any]]) -> None:
         if sid in seen:
             raise TraceSchemaError(f"duplicate span_id: {sid}")
         seen.add(sid)
+    parent_of: dict[str, str | None] = {
+        str(span.get("span_id")): span.get("parent_span_id") for span in trace
+    }
     for span in trace:
         parent = span.get("parent_span_id")
         if parent is not None and str(parent) not in seen:
             raise TraceSchemaError(f"parent_span_id {parent!r} has no matching span")
+    # The parent graph must be acyclic: walking parents from any span must
+    # terminate at a root, never loop back (self-parents included).
+    for start in parent_of:
+        visited: set[str] = set()
+        cur: str | None = start
+        while cur is not None:
+            if cur in visited:
+                raise TraceSchemaError(
+                    f"cyclic parent relationship reached from span {start!r} at {cur!r}"
+                )
+            visited.add(cur)
+            cur = parent_of.get(cur)
 
 
 def render_otel_attributes(span: dict[str, Any]) -> dict[str, str]:
