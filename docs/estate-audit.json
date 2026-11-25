@@ -1,0 +1,34 @@
+{
+ "metadata": {
+  "repo_name": "agents-studio",
+  "last_audit_date": "2026-11-25",
+  "loop_level": 1
+ },
+ "estate_context": {
+  "purpose_domain": "curl-based local agent studio for OpenAI's API",
+  "baseline_commit": "f0c931ebfe42945146b11caef168e8e0902a0a7f",
+  "leader_profiles": [
+   {
+    "name": "openai/openai-python",
+    "url": "https://github.com/openai/openai-python",
+    "checked_date": "2026-11-25"
+   }
+  ]
+ },
+ "evidence_index": {
+  "publications": [
+   {
+    "id": "github:szl-holdings/agents-studio",
+    "link": "https://github.com/szl-holdings/agents-studio",
+    "applicability": "Assigned canonical agent-SDK leader relevant to the curl-based local agent studio domain"
+   }
+  ],
+  "gap_register": [],
+  "prioritized_changes": [
+   "Add CodeQL workflow for backend/ if absent",
+   "Add CI job naming convention",
+   "Add tests for cloud_connection.py"
+  ]
+ },
+ "execution_trace": {}
+}
